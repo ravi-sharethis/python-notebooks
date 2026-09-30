@@ -221,10 +221,22 @@ Finding 6. Supporting detail:
 
 ## 8. Open items / next steps
 
-- **Resolved**: the `MetadataFetchFailedException` shuffle failure — root
-  cause was almost certainly the 64/20 config's 16.95B-edge scale being too
-  big for the available cluster, not a code bug. Rerunning at 32/10 (6.65B
-  edges) completed successfully.
+- **Resolved**: the `MetadataFetchFailedException` shuffle failure, via two
+  changes landed in `IDGraph_CC_Databricks.py`: (1) switched GraphFrames
+  install to `%pip install --force-reinstall graphframes-py==0.12.1`,
+  confirmed working on Databricks Runtime 17.3 LTS/Spark 4.0.0/Scala 2.13 —
+  resolves the GraphFrames/Spark-4.0 compatibility risk flagged early in the
+  project and never verified until now; (2) `connectedComponents()` now
+  called with `broadcastThreshold=-1`, disabling GraphFrames' internal
+  broadcast-join optimization (default threshold 1M rows) — a plausible OOM
+  source under skew, independent of edge count. Combined with dialing the
+  config back to 32/10 (6.65B edges, down from 64/20's 16.95B), the rerun
+  completed. **Not yet disambiguated** whether `broadcastThreshold` or the
+  smaller edge count is what actually fixed it — worth testing `broadcastThreshold=-1`
+  against the original 64/20 config if that config is ever revisited. A
+  `spark.catalog.clearCache()`/`spark.conf.set(io.cache.enabled, false)`
+  attempt was also tried and found unnecessary — left commented in the
+  script as a tried-and-rejected marker.
 - **Resolved (with an unwelcome answer)**: the central open question — does
   tightening `MAX_FANOUT`/`STAR_THRESHOLD` curb the giant component? No.
   Confirmed worse in relative terms (47.3% of all nodes) and compositionally
