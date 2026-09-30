@@ -75,6 +75,22 @@ actual `connectedComponents()` call, while keeping small aggregate outputs
    *doubling* before resuming decay) vs. `id5`'s 2 and `tapad`'s 0, and is the
    only via_type showing measurable within-via_type pair collapse (3.78%, vs.
    0% for `id5`/`tapad`).
+6. **The central question is answered, and the answer is no** — CC completed
+   on full-scale IDGraph3 at `MAX_FANOUT=32`/`STAR_THRESHOLD=10` (see §4 for
+   why that's tighter than the originally-settled 64/20). One component has
+   **2,326,645,218 nodes — 47.3% of all 4,914,094,515 nodes**, larger in
+   relative terms than the ~32% found on the IDGraph2 sample. Worse, its
+   composition shifted: `ID5_UID`+`HEM_MD5` (the durable/trustworthy types)
+   went from ~4.6% combined (old sample) to **~39.6% combined** (new,
+   full-scale, real measurement) — the giant component is no longer mostly
+   churn/bot noise, it now contains a large share of the most trustworthy
+   identifier types too. Mechanism: modest per-type `avg_deg_conn` (2.2-7.2)
+   combined with heavy cross-type edge linking (e.g. `TTD`'s largest partner
+   types are `HEM_MD5`/`ID5_UID`, not itself; `HEM_MD5`'s largest partner is
+   `HARDWARE_IDFA`, not itself) — classic small-world giant-component
+   behavior via short cross-type chains, not any single via_type's fault.
+   Tightening `MAX_FANOUT`/`STAR_THRESHOLD` further is unlikely to fix this;
+   see §8.
 
 ## 4. Threshold decisions
 
@@ -91,6 +107,15 @@ actual `connectedComponents()` call, while keeping small aggregate outputs
 - A single **global** `MAX_FANOUT` is a known compromise — `id5`, `tapad`, and
   `liid` have demonstrably different distribution shapes, so one number can't
   be exactly right for all three. Not yet split into per-via_type values.
+- **Update**: the 64/20 config above was too big for `connectedComponents()`
+  to actually complete on the full dataset (16.95B edges — almost certainly
+  the cause of the `MetadataFetchFailedException` shuffle failure). The
+  pipeline was rerun at **`MAX_FANOUT=32`/`STAR_THRESHOLD=10`** (6.65B
+  edges), which is what actually produced the CC results in §3 Finding 6 and
+  §6b. This was a tractability concession, not a change in the reasoning
+  above — the STAR_THRESHOLD=20 rationale (preserving fidelity for the 11-20
+  band) still applies in principle, just couldn't be afforded in practice on
+  the available cluster.
 
 ## 5. Bugs found & fixed (Databricks pipeline)
 
@@ -147,6 +172,41 @@ collapse): `tapad` 9,253,864,915 = 9,253,864,915 (0%); `id5` 2,736,742,603 =
 2,736,742,603 (0%); `liid` 5,331,099,275 → 5,129,478,154 (3.78% collapse — the
 only via_type showing any).
 
+**Note**: the table above is all under `MAX_FANOUT=64`/`STAR_THRESHOLD=20`.
+That config was never actually run through CC successfully (see §4 update) —
+`edges` at that config is 16,951,041,699 rows, 1.7TB. The config that
+actually completed CC is `MAX_FANOUT=32`/`STAR_THRESHOLD=10`, with
+**6,647,886,786 edges** over the same 4,914,094,515 nodes. `node_types` is
+unaffected by MAX_FANOUT either way (always 4,914,094,515 / 183.5GB).
+
+## 6b. IDGraph3 CC results (MAX_FANOUT=32/STAR_THRESHOLD=10)
+
+Full results in the `idgraph3-current-status` memory entry. Headline: giant
+component confirmed and worse than the IDGraph2 sample suggested — see §3
+Finding 6. Supporting detail:
+
+- **Singletons**: 1,228,969,090 nodes (25.0% of all nodes) are true
+  singletons (never linked to anything) — the first real, unbiased singleton
+  measurement (earlier sample-based attempts were structurally incapable of
+  seeing singletons at all).
+- **Component-size distribution**: smooth decay from n=2 (95,007,081) through
+  the hundreds, then nothing until the single giant outlier at
+  2,326,645,218 — same bimodal "blob + thin tail" shape as the IDGraph2
+  sample, confirmed at full scale.
+- **Per-type connectivity** (`pct_conn` = % of that type's nodes that are
+  non-singleton): `ID5_UID` highest at 89.3%, `HEM_MD5` 83.7%, `ST` 69.7%,
+  `TTD` 67.6%, `HARDWARE_ANDROID_AD_ID` 66.1%, `HARDWARE_IDFA` lowest at
+  61.7%. `avg_deg_conn` (average degree among non-singleton nodes) ranges
+  2.18 (`HARDWARE_IDFA`) to 7.24 (`HEM_MD5`) — modest across the board,
+  which is what makes the giant component's existence a small-world/
+  cross-type-linking phenomenon rather than a "everything has huge degree"
+  one.
+- **`via_type_count`**: 99.31% of edges are single-source (`via_type_count=1`),
+  0.70% dual-source, 0.002% triple-source — confirms the earlier prediction
+  that cross-via_type overlap is modest.
+- **`weight`**: 98.37% of edges have `weight=1` (single co-occurrence
+  instance) — most evidence is single-instance, not repeated.
+
 ## 7. What each file owns
 
 | File | Owns |
@@ -161,20 +221,29 @@ only via_type showing any).
 
 ## 8. Open items / next steps
 
-- **Currently blocked**: `IDGraph_CC_Databricks.py`'s `connectedComponents()`
-  call is failing with `MetadataFetchFailedException` — an executor became
-  completely unreachable mid-shuffle (connection refused, not just slow),
-  most likely an OOM kill given the scale, possibly compounded by skew from
-  high-degree hub nodes or a persisting giant component. Next diagnostic:
-  check the Databricks cluster event log for that executor's removal reason,
-  and check the node degree distribution for extreme outliers.
-- Get the exact `edges.count()` for IDGraph3 (currently only bounded).
-- **The central open question**: does `MAX_FANOUT=64` + hybrid star actually
-  curb the giant component found on IDGraph2, once CC completes on IDGraph3?
-- `liid`'s real tail beyond n=101 and its 3 histogram anomalies are
+- **Resolved**: the `MetadataFetchFailedException` shuffle failure — root
+  cause was almost certainly the 64/20 config's 16.95B-edge scale being too
+  big for the available cluster, not a code bug. Rerunning at 32/10 (6.65B
+  edges) completed successfully.
+- **Resolved (with an unwelcome answer)**: the central open question — does
+  tightening `MAX_FANOUT`/`STAR_THRESHOLD` curb the giant component? No.
+  Confirmed worse in relative terms (47.3% of all nodes) and compositionally
+  different (now ~39.6% durable-type nodes, vs. ~4.6% on the old sample) even
+  at the tighter 32/10 config. See §3 Finding 6, §6b.
+- **New decision needed**: given per-key fanout tuning alone doesn't fix the
+  giant component, decide whether it's worth pursuing a different mitigation
+  (e.g. capping transitive hop count, a post-hoc component-splitting pass —
+  see the "how do we split large groups" reasoning earlier in this project),
+  or whether this level of chaining is actually an acceptable/expected
+  property of the data at this density.
+- `liid`'s real tail beyond n=101 and its 3 histogram anomalies are still
   uninvestigated — worth inspecting real groups near those sizes.
 - `tapad`'s real tail beyond n=101 is also still unseen (`.show(100)`-truncated).
 - Consider rebuilding `via_keys`/`edges` now to get the better file layout
-  from the repartition fix (currently only helps future writes).
+  from the repartition fix (currently only helps future writes) — though
+  note the currently-relevant `edges` is now the 32/10 version (6.65B rows),
+  not the 64/20 one (16.95B rows) the repartition targets (8500/2600) were
+  sized against; may need re-sizing for the smaller table.
 - Consider per-via_type `MAX_FANOUT` given the three via_types' clearly
-  different distribution shapes.
+  different distribution shapes — though given §3 Finding 6, this is now a
+  lower-priority lever than finding an actual giant-component mitigation.
