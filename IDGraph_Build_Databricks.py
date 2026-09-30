@@ -220,25 +220,27 @@ FILTER_TYPES = ["HARDWARE_IDFA", "HARDWARE_ANDROID_AD_ID", "HEM_MD5", "ID5_UID",
 # Safety valve: a single grouping key fanning out to an unreasonable number of distinct
 # nodes gets excluded entirely -- this is the ACTUAL individual-vs-family control knob
 # (not STAR_THRESHOLD below, which only affects edge representation within groups that
-# survive this cap -- see chat for the full reasoning). Set from the real group-size
-# histograms (fan-out audit section below), not a guess -- id5's histogram tops out
-# ~32 with a smooth organic-looking decay; tapad's smooth-but-longer tail made 100
-# look too permissive (100 distinct nodes sharing one key reads as bot/shared-default
-# behavior, not a household) once actually reasoned through. 64 is the settled
-# compromise: comfortably above id5's observed natural max, well below the range that
-# started looking synthetic for tapad.
-MAX_FANOUT = 64
+# survive this cap -- see chat for the full reasoning). ORIGINALLY set to 64 from the
+# real group-size histograms (id5 tops out ~32; tapad/liid values above ~100 started
+# looking bot-like) -- but 64 produced 16.95B edges, which connectedComponents()
+# couldn't actually complete on (MetadataFetchFailedException / executor loss under
+# shuffle, most likely OOM). DIALED BACK to 32 -- a tractability concession, not a
+# reasoning change. This is close to id5's own natural ceiling, so id5 is barely
+# affected; tapad/liid lose everything in the 33-64 range that 64 was chosen to keep.
+# Revisit upward if cluster capacity allows (see IDGraph_Journal.md / chat).
+MAX_FANOUT = 32
 
 # Hybrid star/clique threshold -- PERFORMANCE lever only, does not change which nodes
 # merge into the same identity (a star still fully connects every group member; see
 # chat). Groups size <= STAR_THRESHOLD get full pairwise clique (C(k,2) edges, cheap
 # and preserves per-pair weight/via_type_count fidelity); larger groups (up to
-# MAX_FANOUT) get a star (hub = MIN(node_id), k-1 edges instead of k(k-1)/2). Kept at
-# 20 rather than dropping to 10: the id5 histogram showed the 11-20 size band alone
-# holds ~11.5M groups (more aggregate clique cost than the whole 21-32 band), and
-# that's also the size range most likely to be genuine household/churn evidence worth
-# preserving pairwise weight/via_type_count fidelity for -- worth the extra edges.
-STAR_THRESHOLD = 20
+# MAX_FANOUT) get a star (hub = MIN(node_id), k-1 edges instead of k(k-1)/2).
+# ORIGINALLY kept at 20 (not 10) specifically to preserve pairwise fidelity for the
+# 11-20 size band (~11.5M id5 groups, more aggregate clique cost than the 21-32 band,
+# and the size range most likely to be genuine household/churn evidence) -- but
+# DIALED BACK to 10 alongside MAX_FANOUT=32 for the same tractability reason above.
+# The 11-20 band now goes to star instead of clique, losing that fidelity in practice.
+STAR_THRESHOLD = 10
 
 # Value-level denylist: specific grouping-key VALUES excluded by identity, regardless
 # of fanout -- confirmed recurring bad actor across dataset generations (see chat).

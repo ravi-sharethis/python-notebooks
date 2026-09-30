@@ -13,9 +13,12 @@
 # MAGIC completed stages instead of recomputing them -- the same problem that made the
 # MAGIC build-phase self-joins so painful to re-run after every restart.
 # MAGIC
-# MAGIC **Setup**: needs GraphFrames attached to the cluster (Maven coordinate
-# MAGIC matching your Spark/Scala version, or a PyPI wheel -- see chat for install
-# MAGIC steps).
+# MAGIC **Setup**: `%pip install --force-reinstall graphframes-py==0.12.1` --
+# MAGIC confirmed working on Databricks Runtime 17.3 LTS (Spark 4.0.0 / Scala 2.13).
+# MAGIC This resolves the GraphFrames/Spark-4.0/Scala-2.13 compatibility that was
+# MAGIC an open, unverified risk earlier in the project -- the pip-installable
+# MAGIC `graphframes-py` package (vs. the older Maven-coordinate-JAR approach)
+# MAGIC is what actually works on this runtime.
 # MAGIC
 # MAGIC **Output** (small, safe to download in full): `type_summary`, `type_matrix`,
 # MAGIC `weight_histogram`, `via_type_count_histogram`.
@@ -258,13 +261,33 @@ edge_counts_by_via_type.orderBy(F.desc("pair_rows")).show(truncate=False)
 # MAGIC %md ## Connected components
 # MAGIC The most expensive single step here (an iterative distributed algorithm) --
 # MAGIC definitely worth staging so a restart doesn't force a full re-run.
+# MAGIC
+# MAGIC **`MetadataFetchFailedException` / executor-loss fix**: the original
+# MAGIC MAX_FANOUT=64/STAR_THRESHOLD=20 config (16.95B edges) failed with an
+# MAGIC executor becoming completely unreachable mid-shuffle -- almost certainly an
+# MAGIC OOM kill, likely from GraphFrames' default `broadcastThreshold=1000000`
+# MAGIC attempting a broadcast join that blew up under skew. `broadcastThreshold=-1`
+# MAGIC disables broadcasting entirely, forcing plain shuffle joins throughout.
+# MAGIC Combined with the config being dialed back to MAX_FANOUT=32/STAR_THRESHOLD=10
+# MAGIC (6.65B edges), the rerun succeeded -- exactly which of the two fixed it
+# MAGIC (broadcastThreshold, or just less data) isn't disambiguated yet.
 
 # COMMAND ----------
+
+# Tried clearing cached state before the CC call, in case stale cached
+# DataFrames/Databricks IO cache were contributing to the OOM -- didn't turn
+# out to be needed (the broadcastThreshold + config changes above were
+# sufficient), left here commented as a "tried this, didn't need it" marker
+# rather than deleted, in case it's worth revisiting on a future larger run.
+# spark.catalog.clearCache()
+# spark.conf.set("spark.databricks.io.cache.enabled", "false")
 
 
 @stage_dataframe(write_format="parquet")
 def connected_components_fn(graph, spark=None, write_path=None):
-    return graph.connectedComponents()
+    return graph.connectedComponents(
+        algorithm="graphframes", checkpointInterval=2, broadcastThreshold=-1
+    )
 
 
 components = connected_components_fn(
