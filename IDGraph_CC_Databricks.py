@@ -258,6 +258,84 @@ edge_counts_by_via_type.orderBy(F.desc("pair_rows")).show(truncate=False)
 
 # COMMAND ----------
 
+# MAGIC %md ## Node distribution by type and via_type: singletons vs. plurals
+# MAGIC `via_keys` only ever contains a row for a node if it survived into a real
+# MAGIC (>=2-member, non-excluded) group -- a node with ZERO via_keys rows across
+# MAGIC all 3 via_types can have no edges at all, and a node with >=1 via_keys row
+# MAGIC is guaranteed at least one edge. So "has a via_keys row" and "is a CC
+# MAGIC singleton" are two different measurements of the EXACT SAME population --
+# MAGIC this section derives singleton counts independently from via_keys (no
+# MAGIC dependency on connectedComponents() having run) and cross-checks them
+# MAGIC against the CC-derived singleton counts later, in the per-type summary
+# MAGIC section below.
+# MAGIC
+# MAGIC "Plural" nodes (>=1 via_keys row) are broken down two ways: by (type,
+# MAGIC via_type) -- a node can appear in more than one via_type's bucket here,
+# MAGIC this isn't a partition -- and by (type, n_via_type), which IS a partition
+# MAGIC (every plural node has exactly one n_via_type value: 1, 2, or 3).
+
+# COMMAND ----------
+
+via_keys = spark.read.parquet(f"{BUILD_OUTPUT_PATH}/via_keys")
+
+
+@stage_dataframe(write_format="parquet")
+def plural_by_type_via_type_fn(via_keys_df, type_map_df, spark=None, write_path=None):
+    return (
+        via_keys_df.select("node_id", "via_type")
+        .distinct()
+        .join(type_map_df.withColumnRenamed("id", "node_id"), on="node_id")
+        .groupBy("type", "via_type")
+        .agg(F.countDistinct("node_id").alias("n_plural_nodes"))
+    )
+
+
+plural_by_type_via_type = plural_by_type_via_type_fn(
+    via_keys, type_map, spark=spark, write_path=f"{CC_OUTPUT_PATH}/plural_by_type_via_type"
+)
+print("--- plural nodes by type and via_type (a node can count under >1 via_type) ---")
+plural_by_type_via_type.orderBy("type", "via_type").show(30, truncate=False)
+
+
+@stage_dataframe(write_format="parquet")
+def plural_by_type_n_via_type_fn(via_keys_df, type_map_df, spark=None, write_path=None):
+    per_node_n_via_type = via_keys_df.groupBy("node_id").agg(
+        F.countDistinct("via_type").alias("n_via_type")
+    )
+    return (
+        per_node_n_via_type.join(type_map_df.withColumnRenamed("id", "node_id"), on="node_id")
+        .groupBy("type", "n_via_type")
+        .count()
+        .withColumnRenamed("count", "n_nodes")
+    )
+
+
+plural_by_type_n_via_type = plural_by_type_n_via_type_fn(
+    via_keys, type_map, spark=spark, write_path=f"{CC_OUTPUT_PATH}/plural_by_type_n_via_type"
+)
+print("--- plural nodes by type and n_via_type (partition -- sums to total plural nodes per type) ---")
+plural_by_type_n_via_type.orderBy("type", "n_via_type").show(30, truncate=False)
+
+
+@stage_dataframe(write_format="parquet")
+def singleton_by_type_from_via_keys_fn(node_types_df, via_keys_df, spark=None, write_path=None):
+    plural_node_ids = via_keys_df.select("node_id").distinct()
+    return (
+        node_types_df.join(plural_node_ids, on="node_id", how="left_anti")
+        .groupBy("type")
+        .count()
+        .withColumnRenamed("count", "n_singleton_from_via_keys")
+    )
+
+
+singleton_by_type_from_via_keys = singleton_by_type_from_via_keys_fn(
+    node_types, via_keys, spark=spark, write_path=f"{CC_OUTPUT_PATH}/singleton_by_type_from_via_keys"
+)
+print("--- singleton nodes by type, derived independently from via_keys (no CC dependency) ---")
+singleton_by_type_from_via_keys.orderBy("type").show(truncate=False)
+
+# COMMAND ----------
+
 # MAGIC %md ## Connected components
 # MAGIC The most expensive single step here (an iterative distributed algorithm) --
 # MAGIC definitely worth staging so a restart doesn't force a full re-run.
@@ -421,6 +499,18 @@ def type_totals_fn(result_df, spark=None, write_path=None):
 
 
 type_totals = type_totals_fn(result, spark=spark, write_path=f"{CC_OUTPUT_PATH}/type_totals")
+
+# Cross-check against the via_keys-derived singleton counts from earlier (see
+# the "Node distribution by type and via_type" section) -- these are two
+# independent measurements of the same population (CC's is_singleton vs.
+# "zero via_keys rows") and should match exactly. A mismatch would mean
+# either a real bug in the pipeline or a stale/mismatched via_keys vs. edges
+# build (e.g. one was rebuilt and the other wasn't).
+singleton_cross_check = type_totals.select("type", "singleton").join(
+    singleton_by_type_from_via_keys, on="type"
+).withColumn("matches", F.col("singleton") == F.col("n_singleton_from_via_keys"))
+print("--- singleton cross-check: CC-derived vs. via_keys-derived (should all be True) ---")
+singleton_cross_check.orderBy("type").show(truncate=False)
 
 
 @stage_dataframe(write_format="parquet")
