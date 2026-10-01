@@ -258,21 +258,18 @@ edge_counts_by_via_type.orderBy(F.desc("pair_rows")).show(truncate=False)
 
 # COMMAND ----------
 
-# MAGIC %md ## Node distribution by type and via_type: singletons vs. plurals
+# MAGIC %md ## Node distribution by type and via_type (connected nodes only)
 # MAGIC `via_keys` only ever contains a row for a node if it survived into a real
-# MAGIC (>=2-member, non-excluded) group -- a node with ZERO via_keys rows across
-# MAGIC all 3 via_types can have no edges at all, and a node with >=1 via_keys row
-# MAGIC is guaranteed at least one edge. So "has a via_keys row" and "is a CC
-# MAGIC singleton" are two different measurements of the EXACT SAME population --
-# MAGIC this section derives singleton counts independently from via_keys (no
-# MAGIC dependency on connectedComponents() having run) and cross-checks them
-# MAGIC against the CC-derived singleton counts later, in the per-type summary
-# MAGIC section below.
-# MAGIC
-# MAGIC "Plural" nodes (>=1 via_keys row) are broken down two ways: by (type,
-# MAGIC via_type) -- a node can appear in more than one via_type's bucket here,
-# MAGIC this isn't a partition -- and by (type, n_via_type), which IS a partition
-# MAGIC (every plural node has exactly one n_via_type value: 1, 2, or 3).
+# MAGIC (>=2-member, non-excluded) group, so every node appearing here is
+# MAGIC guaranteed non-singleton. Singleton/connected COUNTS by type are already
+# MAGIC produced by `type_totals_fn` below (from `result`, post-CC) -- no need to
+# MAGIC re-derive those from via_keys here, that would just be a second,
+# MAGIC redundant source for a number we already have. This section only adds the
+# MAGIC dimension type_totals can't give: the via_type breakdown. Connected nodes
+# MAGIC are broken down two ways: by (type, via_type) -- a node can appear in more
+# MAGIC than one via_type's bucket here, this isn't a partition -- and by (type,
+# MAGIC n_via_type), which IS a partition (every connected node has exactly one
+# MAGIC n_via_type value: 1, 2, or 3).
 
 # COMMAND ----------
 
@@ -280,25 +277,25 @@ via_keys = spark.read.parquet(f"{BUILD_OUTPUT_PATH}/via_keys")
 
 
 @stage_dataframe(write_format="parquet")
-def plural_by_type_via_type_fn(via_keys_df, type_map_df, spark=None, write_path=None):
+def connected_by_type_via_type_fn(via_keys_df, type_map_df, spark=None, write_path=None):
     return (
         via_keys_df.select("node_id", "via_type")
         .distinct()
         .join(type_map_df.withColumnRenamed("id", "node_id"), on="node_id")
         .groupBy("type", "via_type")
-        .agg(F.countDistinct("node_id").alias("n_plural_nodes"))
+        .agg(F.countDistinct("node_id").alias("n_connected_nodes"))
     )
 
 
-plural_by_type_via_type = plural_by_type_via_type_fn(
-    via_keys, type_map, spark=spark, write_path=f"{CC_OUTPUT_PATH}/plural_by_type_via_type"
+connected_by_type_via_type = connected_by_type_via_type_fn(
+    via_keys, type_map, spark=spark, write_path=f"{CC_OUTPUT_PATH}/connected_by_type_via_type"
 )
-print("--- plural nodes by type and via_type (a node can count under >1 via_type) ---")
-plural_by_type_via_type.orderBy("type", "via_type").show(30, truncate=False)
+print("--- connected nodes by type and via_type (a node can count under >1 via_type) ---")
+connected_by_type_via_type.orderBy("type", "via_type").show(30, truncate=False)
 
 
 @stage_dataframe(write_format="parquet")
-def plural_by_type_n_via_type_fn(via_keys_df, type_map_df, spark=None, write_path=None):
+def connected_by_type_n_via_type_fn(via_keys_df, type_map_df, spark=None, write_path=None):
     per_node_n_via_type = via_keys_df.groupBy("node_id").agg(
         F.countDistinct("via_type").alias("n_via_type")
     )
@@ -310,29 +307,11 @@ def plural_by_type_n_via_type_fn(via_keys_df, type_map_df, spark=None, write_pat
     )
 
 
-plural_by_type_n_via_type = plural_by_type_n_via_type_fn(
-    via_keys, type_map, spark=spark, write_path=f"{CC_OUTPUT_PATH}/plural_by_type_n_via_type"
+connected_by_type_n_via_type = connected_by_type_n_via_type_fn(
+    via_keys, type_map, spark=spark, write_path=f"{CC_OUTPUT_PATH}/connected_by_type_n_via_type"
 )
-print("--- plural nodes by type and n_via_type (partition -- sums to total plural nodes per type) ---")
-plural_by_type_n_via_type.orderBy("type", "n_via_type").show(30, truncate=False)
-
-
-@stage_dataframe(write_format="parquet")
-def singleton_by_type_from_via_keys_fn(node_types_df, via_keys_df, spark=None, write_path=None):
-    plural_node_ids = via_keys_df.select("node_id").distinct()
-    return (
-        node_types_df.join(plural_node_ids, on="node_id", how="left_anti")
-        .groupBy("type")
-        .count()
-        .withColumnRenamed("count", "n_singleton_from_via_keys")
-    )
-
-
-singleton_by_type_from_via_keys = singleton_by_type_from_via_keys_fn(
-    node_types, via_keys, spark=spark, write_path=f"{CC_OUTPUT_PATH}/singleton_by_type_from_via_keys"
-)
-print("--- singleton nodes by type, derived independently from via_keys (no CC dependency) ---")
-singleton_by_type_from_via_keys.orderBy("type").show(truncate=False)
+print("--- connected nodes by type and n_via_type (partition -- sums to total connected nodes per type) ---")
+connected_by_type_n_via_type.orderBy("type", "n_via_type").show(30, truncate=False)
 
 # COMMAND ----------
 
@@ -500,18 +479,6 @@ def type_totals_fn(result_df, spark=None, write_path=None):
 
 type_totals = type_totals_fn(result, spark=spark, write_path=f"{CC_OUTPUT_PATH}/type_totals")
 
-# Cross-check against the via_keys-derived singleton counts from earlier (see
-# the "Node distribution by type and via_type" section) -- these are two
-# independent measurements of the same population (CC's is_singleton vs.
-# "zero via_keys rows") and should match exactly. A mismatch would mean
-# either a real bug in the pipeline or a stale/mismatched via_keys vs. edges
-# build (e.g. one was rebuilt and the other wasn't).
-singleton_cross_check = type_totals.select("type", "singleton").join(
-    singleton_by_type_from_via_keys, on="type"
-).withColumn("matches", F.col("singleton") == F.col("n_singleton_from_via_keys"))
-print("--- singleton cross-check: CC-derived vs. via_keys-derived (should all be True) ---")
-singleton_cross_check.orderBy("type").show(truncate=False)
-
 
 @stage_dataframe(write_format="parquet")
 def conn_identities_fn(result_df, spark=None, write_path=None):
@@ -563,6 +530,39 @@ summary = type_summary_fn(
     write_path=f"{CC_OUTPUT_PATH}/type_summary",
 )
 summary.orderBy("type").show(truncate=False)
+
+# COMMAND ----------
+
+# MAGIC %md ### Singleton / connected composition by type
+# MAGIC Different question from `pct_conn` above (which asks, per type, what %
+# MAGIC of ITS OWN nodes are connected). This asks: of ALL singleton nodes across
+# MAGIC every type, what % does each type account for -- and separately for
+# MAGIC connected nodes. Each of the two percentage columns sums to 100% across
+# MAGIC the 6 rows.
+
+# COMMAND ----------
+
+
+@stage_dataframe(write_format="parquet")
+def singleton_connected_composition_fn(summary_df, spark=None, write_path=None):
+    totals = summary_df.agg(
+        F.sum("singleton").alias("total_singleton"),
+        F.sum("connected").alias("total_connected"),
+    )
+    return (
+        summary_df.select("type", "singleton", "connected")
+        .crossJoin(totals)
+        .withColumn("pct_of_all_singletons", 100 * F.col("singleton") / F.col("total_singleton"))
+        .withColumn("pct_of_all_connected", 100 * F.col("connected") / F.col("total_connected"))
+        .drop("total_singleton", "total_connected")
+    )
+
+
+singleton_connected_composition = singleton_connected_composition_fn(
+    summary, spark=spark, write_path=f"{CC_OUTPUT_PATH}/singleton_connected_composition"
+)
+print("--- singleton/connected composition by type (each pct column sums to 100%) ---")
+singleton_connected_composition.orderBy("type").show(truncate=False)
 
 # COMMAND ----------
 
