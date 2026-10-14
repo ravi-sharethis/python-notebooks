@@ -441,6 +441,14 @@ pivot = type_mix_pd.pivot(index=["bucket_order", "size_bucket"], columns="type",
 pivot = pivot.sort_index(level="bucket_order").droplevel("bucket_order")
 print(pivot.round(2).to_string())
 
+# Quick-reference callout: 1=singleton, 2=pair, 5=small group, 10=STAR_THRESHOLD's
+# exact cutover (the largest size still guaranteed full clique representation --
+# everything above this starts losing direct non-hub-to-non-hub pairwise fidelity).
+# These are already individual exact buckets above -- no new computation, just
+# pulled out for quick side-by-side reading.
+print("--- type mix at reference sizes (1=singleton, 2=pair, 5, 10=STAR_THRESHOLD cutover) ---")
+print(pivot.loc[pivot.index.isin(["1", "2", "5", "10"])].round(2).to_string())
+
 # COMMAND ----------
 
 # MAGIC %md ## Per-type summary
