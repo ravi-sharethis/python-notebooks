@@ -461,6 +461,58 @@ top_component_breakdown.orderBy(F.desc("type_count")).show(100, truncate=False)
 
 # COMMAND ----------
 
+# MAGIC %md ## Type mix by component-size bucket
+# MAGIC Generalizes the top-N breakdown above across the WHOLE size spectrum,
+# MAGIC not just the single largest component(s) -- same geometric bucketing as
+# MAGIC the component-size histogram chart (exact 1-20, doubling-width bins
+# MAGIC 21-1024, giant component in its own bucket). Answers: does the type MIX
+# MAGIC shift as components get bigger, or stay roughly constant? Fully derived
+# MAGIC from `result` -- no new data, no edges needed.
+
+# COMMAND ----------
+
+
+@stage_dataframe(write_format="parquet")
+def type_mix_by_size_bucket_fn(result_df, spark=None, write_path=None):
+    bucketed = result_df.withColumn(
+        "bucket_order",
+        F.when(F.col("component_size") <= 20, F.col("component_size"))
+        .when(F.col("component_size") <= 32, F.lit(21))
+        .when(F.col("component_size") <= 64, F.lit(33))
+        .when(F.col("component_size") <= 128, F.lit(65))
+        .when(F.col("component_size") <= 256, F.lit(129))
+        .when(F.col("component_size") <= 512, F.lit(257))
+        .when(F.col("component_size") <= 1024, F.lit(513))
+        .otherwise(F.lit(999999999)),
+    ).withColumn(
+        "size_bucket",
+        F.when(F.col("component_size") <= 20, F.col("component_size").cast("string"))
+        .when(F.col("component_size") <= 32, F.lit("21-32"))
+        .when(F.col("component_size") <= 64, F.lit("33-64"))
+        .when(F.col("component_size") <= 128, F.lit("65-128"))
+        .when(F.col("component_size") <= 256, F.lit("129-256"))
+        .when(F.col("component_size") <= 512, F.lit("257-512"))
+        .when(F.col("component_size") <= 1024, F.lit("513-1024"))
+        .otherwise(F.lit("giant (>1024)")),
+    )
+    counts = bucketed.groupBy("bucket_order", "size_bucket", "type").agg(F.count("id").alias("n_nodes"))
+    bucket_totals = counts.groupBy("bucket_order", "size_bucket").agg(F.sum("n_nodes").alias("bucket_total"))
+    return counts.join(bucket_totals, on=["bucket_order", "size_bucket"]).withColumn(
+        "pct_of_bucket", 100 * F.col("n_nodes") / F.col("bucket_total")
+    )
+
+
+type_mix_by_size_bucket = type_mix_by_size_bucket_fn(
+    result, spark=spark, write_path=f"{CC_OUTPUT_PATH}/type_mix_by_size_bucket"
+)
+type_mix_pd = type_mix_by_size_bucket.select("bucket_order", "size_bucket", "type", "pct_of_bucket").toPandas()
+print("--- type mix (% of nodes in that size bucket) by component-size bucket ---")
+pivot = type_mix_pd.pivot(index=["bucket_order", "size_bucket"], columns="type", values="pct_of_bucket")
+pivot = pivot.sort_index(level="bucket_order").droplevel("bucket_order")
+print(pivot.round(2).to_string())
+
+# COMMAND ----------
+
 # MAGIC %md ## Per-type summary
 # MAGIC Broken into staged sub-tables (totals, conn_identities, degree_counts) before
 # MAGIC the final join -- same granularity as the build script's `id5_pre`/`tapad_pre`/
