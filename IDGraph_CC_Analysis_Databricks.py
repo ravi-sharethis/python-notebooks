@@ -443,6 +443,44 @@ print(pivot.round(2).to_string())
 
 # COMMAND ----------
 
+# MAGIC %md ### Size-2 exact type-pair breakdown
+# MAGIC `type_mix_by_size_bucket_fn` above only gives the NODE-level type % within a
+# MAGIC size bucket -- it can't tell you whether a specific pair's two nodes are the
+# MAGIC same type or different types (e.g. size 2's 85.78% ID5_UID is consistent
+# MAGIC with mostly-same-type pairs, but isn't direct proof of it). A size-2
+# MAGIC component is guaranteed exactly one edge (that's what makes it one
+# MAGIC component instead of two singletons, and `edges` is already deduplicated
+# MAGIC per pair), so joining `edges` to `result` filtered to component_size==2 on
+# MAGIC both endpoints gives the EXACT type-pair distribution, no inference needed.
+
+# COMMAND ----------
+
+
+@stage_dataframe(write_format="parquet")
+def size2_type_pair_breakdown_fn(result_df, edges_df, spark=None, write_path=None):
+    size2_types = result_df.filter(F.col("component_size") == 2).select("id", "type")
+    joined = (
+        edges_df.select("node_a", "node_b")
+        .join(size2_types.withColumnRenamed("id", "node_a").withColumnRenamed("type", "type_a"), on="node_a")
+        .join(size2_types.withColumnRenamed("id", "node_b").withColumnRenamed("type", "type_b"), on="node_b")
+    )
+    canonical = joined.select(
+        F.least("type_a", "type_b").alias("type_1"),
+        F.greatest("type_a", "type_b").alias("type_2"),
+    )
+    counts = canonical.groupBy("type_1", "type_2").count().withColumnRenamed("count", "n_pairs")
+    total = counts.agg(F.sum("n_pairs").alias("total")).collect()[0]["total"]
+    return counts.withColumn("pct", 100 * F.col("n_pairs") / F.lit(total))
+
+
+size2_type_pair_breakdown = size2_type_pair_breakdown_fn(
+    result, edges, spark=spark, write_path=f"{CC_OUTPUT_PATH}/size2_type_pair_breakdown"
+)
+print("--- exact type-pair breakdown for size-2 components ---")
+size2_type_pair_breakdown.orderBy(F.desc("n_pairs")).show(50, truncate=False)
+
+# COMMAND ----------
+
 # MAGIC %md ## Per-type summary
 # MAGIC Broken into staged sub-tables (totals, conn_identities, degree_counts) before
 # MAGIC the final join -- same granularity as the build script's `id5_pre`/`tapad_pre`/
