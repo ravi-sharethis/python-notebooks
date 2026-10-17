@@ -75,22 +75,33 @@ actual `connectedComponents()` call, while keeping small aggregate outputs
    *doubling* before resuming decay) vs. `id5`'s 2 and `tapad`'s 0, and is the
    only via_type showing measurable within-via_type pair collapse (3.78%, vs.
    0% for `id5`/`tapad`).
-6. **The central question is answered, and the answer is no** — CC completed
-   on full-scale IDGraph3 at `MAX_FANOUT=32`/`STAR_THRESHOLD=10` (see §4 for
-   why that's tighter than the originally-settled 64/20). One component has
-   **2,326,645,218 nodes — 47.3% of all 4,914,094,515 nodes**, larger in
-   relative terms than the ~32% found on the IDGraph2 sample. Worse, its
-   composition shifted: `ID5_UID`+`HEM_MD5` (the durable/trustworthy types)
-   went from ~4.6% combined (old sample) to **~39.6% combined** (new,
-   full-scale, real measurement) — the giant component is no longer mostly
-   churn/bot noise, it now contains a large share of the most trustworthy
-   identifier types too. Mechanism: modest per-type `avg_deg_conn` (2.2-7.2)
-   combined with heavy cross-type edge linking (e.g. `TTD`'s largest partner
-   types are `HEM_MD5`/`ID5_UID`, not itself; `HEM_MD5`'s largest partner is
-   `HARDWARE_IDFA`, not itself) — classic small-world giant-component
-   behavior via short cross-type chains, not any single via_type's fault.
-   Tightening `MAX_FANOUT`/`STAR_THRESHOLD` further is unlikely to fix this;
-   see §8.
+6. **First measurement, at `MAX_FANOUT=32`/`STAR_THRESHOLD=10`** (see §4 for
+   why that's tighter than the originally-settled 64/20, which never
+   completed CC). One component had **2,326,645,218 nodes — 47.3% of all
+   4,914,094,515 nodes**, larger in relative terms than the ~32% found on the
+   IDGraph2 sample. Its composition had also shifted: `ID5_UID`+`HEM_MD5`
+   (the durable/trustworthy types) went from ~4.6% combined (old sample) to
+   ~39.6% combined — no longer mostly churn/bot noise. At the time this
+   looked like evidence that threshold tightening doesn't work — **see
+   Finding 7, which overturns that conclusion.**
+7. **Corrected: tightening DOES curb the giant component, non-linearly.** A
+   second CC run at `MAX_FANOUT=16`/`STAR_THRESHOLD=6` shrank the giant
+   component to **697,176,027 nodes — 14.19%** of all nodes (down from
+   47.3% at 32/10). Only two real data points exist (32/10, 16/6), but the
+   jump suggests a **percolation-like threshold effect** — moderate
+   tightening (300ish→32) barely helped, aggressive tightening (32→16)
+   caused real fragmentation. **The cost**: singleton rate nearly doubled,
+   25.01%→**49.21%** — tightening strands far more nodes with zero links at
+   all, a real tradeoff, not a free win. The 16/6 giant component's type mix
+   also shifted: `TTD` rose to 35.85% (from 28.94%) while hardware types fell
+   (`HARDWARE_ANDROID_AD_ID` 14.0%→10.48%, `HARDWARE_IDFA` 14.17%→8.35%) —
+   hardware-driven bridging was cut much more effectively than TTD-driven
+   bridging, suggesting `TTD` needs its own targeted fix regardless of where
+   the threshold ends up. One specific pathology at 32/10 — near-total `TTD`
+   dominance (79-81%) in the 257-1024 component-size range, breaking an
+   otherwise smooth trend — **disappeared completely** at 16/6, concrete
+   evidence `MAX_FANOUT` does targeted, not just uniform, work. See §8 for
+   next steps; don't re-litigate "does tightening help" — it's resolved.
 
 ## 4. Threshold decisions
 
@@ -150,6 +161,16 @@ actual `connectedComponents()` call, while keeping small aggregate outputs
    targets (`edges_fn=8500`, `via_keys_fn=2600`, ~200MB/file). **Only affects
    future writes** — the existing 1.7TB `edges`/522.5GB `via_keys` predate
    this fix and would need deletion + rebuild to benefit.
+7. **`is_singleton` never persisted, surfaced by the notebook split** —
+   `IDGraph_CC_Databricks.py` added `is_singleton` via `.withColumn()`
+   *after* `result_with_size_fn` had already written `result` to Delta and
+   read it back — a purely in-memory, lazy addition never written to disk.
+   Invisible in the original single-file version (one continuous in-memory
+   `result` object); surfaced once `IDGraph_CC_Analysis_Databricks.py` read
+   `result` fresh from `RESULT_PATH` and `type_totals_fn` referenced a
+   column that didn't exist there. Fixed by computing singleton directly
+   from `component_size == 1` (a column that *is* persisted); the dead
+   `.withColumn()` line was removed from the compute notebook.
 
 ## 6. Measured IDGraph3 dataset characteristics
 
@@ -238,25 +259,38 @@ Finding 6. Supporting detail:
   `spark.catalog.clearCache()`/`spark.conf.set(io.cache.enabled, false)`
   attempt was also tried and found unnecessary — left commented in the
   script as a tried-and-rejected marker.
-- **Resolved (with an unwelcome answer)**: the central open question — does
-  tightening `MAX_FANOUT`/`STAR_THRESHOLD` curb the giant component? No.
-  Confirmed worse in relative terms (47.3% of all nodes) and compositionally
-  different (now ~39.6% durable-type nodes, vs. ~4.6% on the old sample) even
-  at the tighter 32/10 config. See §3 Finding 6, §6b.
-- **New decision needed**: given per-key fanout tuning alone doesn't fix the
-  giant component, decide whether it's worth pursuing a different mitigation
-  (e.g. capping transitive hop count, a post-hoc component-splitting pass —
-  see the "how do we split large groups" reasoning earlier in this project),
-  or whether this level of chaining is actually an acceptable/expected
-  property of the data at this density.
+- **Resolved, corrected**: does tightening `MAX_FANOUT`/`STAR_THRESHOLD` curb
+  the giant component? **Yes, non-linearly** — 47.3% (32/10) → 14.19% (16/6).
+  See §3 Finding 7. Don't re-litigate the earlier "no" conclusion (Finding 6)
+  — it was based on only one data point and is superseded.
+- **New decision needed**: only two points on the threshold/giant-component
+  curve exist (32/10, 16/6), and 16/6's improvement came at the cost of
+  nearly doubling the singleton rate (25.01%→49.21%). Decide: (a) test a
+  point between or below these to map the curve properly, (b) whether 16/6's
+  tradeoff is actually better than 32/10's given the real goal (avoiding
+  over-merging vs. under-merging), (c) run the still-not-executed
+  via_type_count>=2-filtered CC test and per-via_type CC test to check
+  whether `TTD` specifically needs a targeted fix — its share of the giant
+  component *rose* under tightening (28.94%→35.85%) while hardware types'
+  fell, suggesting it's the more stubborn contributor.
+- **New**: `size2_type_pair_breakdown_fn` (added to
+  `IDGraph_CC_Analysis_Databricks.py`) has not been run yet — would settle
+  the "~85% of size-2 components are pure ID5_UID-ID5_UID pairs" question
+  directly instead of via the mathematical lower-bound inference currently
+  backing it.
+- **New**: the `id5` n=16 anomaly is now confirmed a THIRD independent time
+  (raw histogram, 32/10 type-mix, 16/6 type-mix) — recurs at exactly size 16
+  regardless of whether 16 is our own `MAX_FANOUT` boundary, pointing at an
+  artifact intrinsic to `id5`'s upstream data generation. Worth an actual
+  dedicated investigation now rather than continuing to just note it.
 - `liid`'s real tail beyond n=101 and its 3 histogram anomalies are still
   uninvestigated — worth inspecting real groups near those sizes.
 - `tapad`'s real tail beyond n=101 is also still unseen (`.show(100)`-truncated).
 - Consider rebuilding `via_keys`/`edges` now to get the better file layout
   from the repartition fix (currently only helps future writes) — though
-  note the currently-relevant `edges` is now the 32/10 version (6.65B rows),
-  not the 64/20 one (16.95B rows) the repartition targets (8500/2600) were
-  sized against; may need re-sizing for the smaller table.
+  note the currently-relevant `edges` is now built at whichever config is
+  live (32/10 or 16/6), not the 64/20 one (16.95B rows) the repartition
+  targets (8500/2600) were originally sized against; may need re-sizing.
 - Consider per-via_type `MAX_FANOUT` given the three via_types' clearly
-  different distribution shapes — though given §3 Finding 6, this is now a
-  lower-priority lever than finding an actual giant-component mitigation.
+  different distribution shapes, and given `TTD` now looks like the
+  specific lever worth isolating (see above).
