@@ -268,7 +268,6 @@ def result_with_size_fn(components_df, spark=None, write_path=None):
 
 
 result = result_with_size_fn(components, spark=spark, write_path=RESULT_PATH)
-result = result.withColumn("is_singleton", F.col("component_size") == 1)
 
 # One-time optimization for the point-query helpers / analysis notebook -- clusters
 # rows by `component` within files so a lookup skips most of the table instead of
