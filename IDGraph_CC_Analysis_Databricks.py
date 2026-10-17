@@ -493,7 +493,7 @@ size2_type_pair_breakdown.orderBy(F.desc("n_pairs")).show(50, truncate=False)
 def type_totals_fn(result_df, spark=None, write_path=None):
     return result_df.groupBy("type").agg(
         F.count("id").alias("total"),
-        F.sum(F.col("is_singleton").cast("int")).alias("singleton"),
+        F.sum((F.col("component_size") == 1).cast("int")).alias("singleton"),
     )
 
 
