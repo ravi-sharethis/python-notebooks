@@ -435,11 +435,23 @@ def type_mix_by_size_bucket_fn(result_df, spark=None, write_path=None):
 type_mix_by_size_bucket = type_mix_by_size_bucket_fn(
     result, spark=spark, write_path=f"{CC_OUTPUT_PATH}/type_mix_by_size_bucket"
 )
-type_mix_pd = type_mix_by_size_bucket.select("bucket_order", "size_bucket", "type", "pct_of_bucket").toPandas()
+type_mix_pd = type_mix_by_size_bucket.select(
+    "bucket_order", "size_bucket", "type", "n_nodes", "pct_of_bucket"
+).toPandas()
+
 print("--- type mix (% of nodes in that size bucket) by component-size bucket ---")
-pivot = type_mix_pd.pivot(index=["bucket_order", "size_bucket"], columns="type", values="pct_of_bucket")
-pivot = pivot.sort_index(level="bucket_order").droplevel("bucket_order")
-print(pivot.round(2).to_string())
+pct_pivot = type_mix_pd.pivot(index=["bucket_order", "size_bucket"], columns="type", values="pct_of_bucket")
+pct_pivot = pct_pivot.sort_index(level="bucket_order").droplevel("bucket_order")
+print(pct_pivot.round(2).to_string())
+
+# pct_of_bucket alone hides magnitude -- a bucket with a handful of total nodes and
+# one with a billion can show the same % share despite wildly different absolute
+# weight. n_nodes was already computed by type_mix_by_size_bucket_fn (needed
+# internally to derive pct_of_bucket) -- just wasn't being printed until now.
+print("--- raw node counts (not %) by type and component-size bucket ---")
+count_pivot = type_mix_pd.pivot(index=["bucket_order", "size_bucket"], columns="type", values="n_nodes")
+count_pivot = count_pivot.sort_index(level="bucket_order").droplevel("bucket_order")
+print(count_pivot.fillna(0).astype(int).to_string())
 
 # COMMAND ----------
 
