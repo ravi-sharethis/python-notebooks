@@ -294,3 +294,103 @@ Finding 6. Supporting detail:
 - Consider per-via_type `MAX_FANOUT` given the three via_types' clearly
   different distribution shapes, and given `TTD` now looks like the
   specific lever worth isolating (see above).
+- **Resolved (2026-10-20): recovered the full 16/6 component-size histogram**
+  that a prior session (`f235666f-...`) pasted in full but only ever
+  summarized into memory ("573 distinct ordinary sizes, zero gap") rather
+  than preserving the raw per-size counts — a real gap, since that session
+  ended (crashed) shortly after. Recovered by reading that session's own
+  transcript file directly. Both configs' full per-size histograms (573
+  ordinary sizes at 16/6, 276 at 32/10 — each independently verified to sum
+  to the known exact node/component totals with zero gap) are now saved as
+  `idgraph3_component_size_histogram_{16_6,32_10}.csv` alongside this
+  journal, and used directly (not bounded/estimated) in the
+  `idgraph3-threshold-report` artifact's "by number of components"
+  distribution.
+- **New finding, from the same recovered data: extreme single-via_type
+  components exist at the very top of the "ordinary" (non-giant) size range,
+  in both configs** — a nuance the bucket-averaged `257-512`/`513-1024`
+  TTD-dominance pathology (§3 Finding 7) doesn't capture on its own. At
+  32/10, the single largest non-giant component (size 617) is **100% TTD**
+  — every one of its 617 nodes is a TTD cookie, with zero cross-type
+  bridging. At 16/6, the single largest non-giant component (size 865) is
+  **77.7% TTD** (672/865 nodes). Both sit in `513-1024`, the exact bucket
+  where 32/10's bucket-*average* TTD share was reported as resolved/smooth
+  at 16/6 — the average looking normal doesn't mean individual outlier
+  components aren't still extreme. Full per-type breakdown of each config's
+  top 5 largest components (giant + next 4) saved to
+  `idgraph3_top5_components_by_type.csv`. Worth deciding whether this
+  changes the read on "is the TTD pathology actually resolved."
+
+## 9. The `idgraph3-threshold-report` artifact — structure & reproducibility
+
+Live at https://claude.ai/code/artifact/c534d31d-b335-49f3-b465-9178336b9916
+(private Claude artifact). The canonical, editable HTML source — the page
+content only, without the viewer's injected `<head>`/frame-runtime wrapper —
+is saved alongside this journal as `idgraph3_threshold_report.html`. To
+update it in a future session: edit that file, then publish it to the same
+artifact URL (Claude's `Artifact` tool, `action: "publish"`, passing `url`).
+To pull a fresh copy of what's live instead (e.g. if it was edited from the
+artifact's own share UI), use `action: "read"` on the URL, then strip the
+single leading line (injected preamble/style/`<body>`) and the trailing
+`</body></html>` — the real content is everything in between.
+
+**Units convention**: every figure in the report is a NODE count unless
+explicitly tagged COMPONENTS (a small pill next to the section heading, e.g.
+`<span class="unit-tag">NODES</span>` / `<span class="unit-tag
+components">COMPONENTS</span>`) — this was added after a reader mistook a
+"giant component" value for a *count* of giant components (there's exactly
+one, per config) rather than its node count. A mixed-unit table (the
+per-type summary) gets a text legend instead of a single tag.
+
+**Section-by-section structure, in order, with data source**:
+1. Methodology — static prose + a units-convention callout box.
+2. Headline numbers (`.stat-strip`, 4-wide grid) — total nodes; giant
+   component % + exact node counts per config; singleton rate; total
+   components + singleton/non-singleton split per config (singletons are
+   ~83%/89% of all components — see §8); a full-width `HEM_MD5` breakdown
+   card (singleton / ordinary / giant node counts + %, both configs — added
+   because HEM_MD5 uniquely *flips* which group holds the majority of its
+   nodes: giant-dominated 59.4% at 32/10, singleton-dominated 46.8% at 16/6,
+   unlike every other type which just shifts gradually).
+3. Key findings — static prose bullets, sourced from §3/§6b of this journal.
+4. Nodes by type table — from the per-type summary paste (journal §3/§6b).
+5. Component-size distribution, by nodes — `bucket_totals_{32_10,16_6}`
+   arrays in the page's embedded `chartData`, SVG bar chart drawn in JS.
+6. Component-size distribution, by components — `comp_lo/hi/exact_*`
+   arrays in `chartData`; now fully exact for both configs, sourced from
+   `idgraph3_component_size_histogram_{32_10,16_6}.csv` (see §8 — these are
+   the real per-size histograms, not reconstructed).
+7. Type mix by bucket (%), raw node counts by bucket, CDFs — from the
+   `ws_*`/`wos_*`/type-mix-table pastes in the crashed session transcript
+   (32/10 reconstructed within 0.01% from histogram + %, 16/6 exact).
+8. Per-type summary, singleton/connected composition — from the
+   `conn_identities`/`pct_conn`/etc. paste, same transcript.
+9. Caveats — enumerates every approximation/reconstruction still in the
+   report; keep this in sync whenever a "reconstructed" figure gets
+   replaced with a real one (as happened for the component-count chart).
+
+**CDF chart color/marker scheme**: the original 6 type colors had two
+greens (`ID5_UID` `#4C8C6B`, `HEM_MD5` `#3E7C8C`) sitting next to each other
+and were replaced using the `dataviz` skill's validated categorical palette
+and `validate_palette.js`. A hard limit surfaced during this: that palette's
+docs state only its first ~3 slots clear the strict `--pairs all` CVD gate
+(all lines mutually visible, as in this 6-series CDF) — no selection of 6 of
+its 8 hues passes cleanly in both light and dark. Final choice (best
+available, light passes cleanly, dark needed a custom re-stepped violet to
+clear the chroma floor): `ID5_UID`=blue, `TTD`=red, `AAID`=aqua,
+`HARDWARE_IDFA`=yellow, `HEM_MD5`=violet, `ST`=green — defined as
+`--series-*` CSS custom properties (light/dark/`[data-theme]`, same pattern
+as the rest of the page's tokens) and referenced via `var()` directly in SVG
+`stroke`/`fill` attributes. Residual CVD risk is compensated with a second,
+color-independent channel: each type also gets a distinct marker shape
+(circle/square/triangle/diamond/cross/star), drawn at 8 fixed bucket indices
+per line and mirrored in the legend icons — this is the generally-applicable
+fix when a chart needs more simultaneous categorical series than a validated
+palette can cleanly separate on color alone.
+
+**If rebuilding from scratch**: the three CSVs in this directory
+(`idgraph3_component_size_histogram_32_10.csv`,
+`idgraph3_component_size_histogram_16_6.csv`,
+`idgraph3_top5_components_by_type.csv`) plus the per-type summary numbers in
+§6b of this journal are sufficient to regenerate every number in the report
+without needing the original Databricks pastes again.
