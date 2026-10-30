@@ -230,14 +230,14 @@ Finding 6. Supporting detail:
 
 ## 7. What each file owns
 
-**Location (2026-10-30)**: repo reorganized by project. ID graph: this
-journal, local notebooks (`IDGraph_EDA`, `IDGraph_ConnectedComponents` +
-`connected_components.py`) in `IDGraph/`; saved CSV outputs in
-`IDGraph/results/`; HTML reports in `IDGraph/reports/`. Databricks notebooks
-in `python-databricks/IDGraph/`, shared `staging_df.py` in
-`python-databricks/`. TTD pricing work in `TTD/`, other notebooks in `misc/`.
-Older entries below that say a file is "in python-notebooks/" or "in this
-directory" refer to these locations now.
+**Location (2026-10-30)**: repo reorganized by project. ID graph local
+side in `IDGraph-local/`: this journal, local notebooks (`IDGraph_EDA`,
+`IDGraph_ConnectedComponents` + `connected_components.py`), saved CSV outputs
+in `IDGraph-local/results/`, HTML reports in `IDGraph-local/reports/`.
+Databricks notebooks in `python-databricks/IDGraph/`, shared `staging_df.py`
+in `python-databricks/`. TTD pricing work in `TTD/`, other notebooks in
+`misc/`. Older entries below that say a file is "in python-notebooks/" or
+"in this directory" refer to these locations now.
 
 | File | Owns |
 |---|---|
