@@ -188,6 +188,15 @@ BUILD_OUTPUT_PATH = "s3://data-science-research/ravi/IDGraph3/build_output/"
 CC_OUTPUT_PATH = "s3://data-science-research/ravi/IDGraph3/cc_output/"
 RESULT_PATH = f"{CC_OUTPUT_PATH}/result"
 
+# Affinity crosswalk refresh date -- update manually when a newer refresh should be
+# used. Not auto-detected on purpose: picking up a new refresh silently would change
+# every downstream targetability number without a corresponding code change to point
+# at in git history.
+AFFINITY_RDATE = "20261008"
+AFFINITY_CROSSWALK_PATH = (
+    f"s3://data-science-research/affinity_matching/DCR/refresh/{AFFINITY_RDATE}/crosswalk/all_id_to_afs_id"
+)
+
 # COMMAND ----------
 
 # MAGIC %md ## Load build + CC output
@@ -492,6 +501,258 @@ print("--- exact type-pair breakdown for size-2 components ---")
 size2_type_pair_breakdown.orderBy(F.desc("n_pairs")).show(50, truncate=False)
 
 # COMMAND ----------
+
+# MAGIC %md ## Affinity crosswalk matching
+# MAGIC One new table: `affinity_enhanced_components` -- an exact replica of
+# MAGIC `result` (id/type/component/component_size, all 6 types, same row
+# MAGIC count) plus two columns:
+# MAGIC - `afs_individual_ids` (`array<string>`) -- every `AFS_INDIVIDUAL_ID` the
+# MAGIC   DCR crosswalk (`all_id_to_afs_id`, refresh `AFFINITY_RDATE`) maps this
+# MAGIC   node to. A node can map to more than one, so this is an array, not a
+# MAGIC   scalar -- collapsing it down to "first match" would silently throw
+# MAGIC   away real information. Empty for every node of a non-eligible type.
+# MAGIC - `has_afs_id` (`boolean`) -- `size(afs_individual_ids) > 0`. Precomputed
+# MAGIC   so a downstream aggregate over this large table doesn't need to check
+# MAGIC   array length every time.
+# MAGIC
+# MAGIC Only `HEM_MD5` and the two "maids" (`HARDWARE_ANDROID_AD_ID`/
+# MAGIC `HARDWARE_IDFA`) are actually joined against the crosswalk -- it has no
+# MAGIC entries for `ID5_UID`/`TTD`/`ST`, so their rows get `afs_individual_ids=[]`
+# MAGIC directly, not a join against a table with nothing to match.
+# MAGIC
+# MAGIC Adapted from a function pasted in by Ravi (Databricks-assistant-authored).
+# MAGIC Changes from the original: requires `Subtype=="md5"` for the `hem` match
+# MAGIC (our node type is specifically `HEM_MD5`, not generic `hem`); one staged
+# MAGIC sub-table per type, unioned last (same granularity as `id5_pre`/
+# MAGIC `tapad_pre`/`liid_pre` in the build script, so a retry only redoes
+# MAGIC whichever type didn't finish); and multiple crosswalk matches for the
+# MAGIC same node are gathered into `afs_individual_ids` via `collect_set`
+# MAGIC instead of silently fanning out into duplicate rows via the join alone.
+
+# COMMAND ----------
+
+# cc_type -> (crosswalk Type, crosswalk Subtype or None to match Type alone)
+AFFINITY_TYPE_MAP = [
+    ("HEM_MD5", "hem", "md5"),
+    ("HARDWARE_ANDROID_AD_ID", "android", None),
+    ("HARDWARE_IDFA", "ios", None),
+]
+AFFINITY_TYPES = [cc_type for cc_type, _, _ in AFFINITY_TYPE_MAP]
+
+affinity_cw = spark.read.parquet(AFFINITY_CROSSWALK_PATH)
+
+
+@stage_dataframe(write_format="parquet")
+def affinity_match_one_type_fn(result_df, cw_df, cc_type, cw_type, cw_subtype, spark=None, write_path=None):
+    """
+    One cc_type's slice of `result`, left-joined to the crosswalk rows for
+    its (cw_type[, cw_subtype]), then collapsed back to exactly one row per
+    node with every matched AFS_INDIVIDUAL_ID gathered into an array --
+    `collect_set` drops the join's NULL for a node with no match, so an
+    unmatched node naturally comes out with an empty array, no special
+    casing needed. `id` is "TYPE:value" -- split off the value before
+    matching against the crosswalk's bare hashed-email/device id.
+    """
+    cc_slice = result_df.filter(F.col("type") == cc_type).withColumn(
+        "match_value", F.split(F.col("id"), ":", 2).getItem(1)
+    )
+
+    cw_filtered = cw_df.select(
+        F.col("ID").alias("cw_id"),
+        F.col("Type").alias("cw_type"),
+        F.col("Subtype").alias("cw_subtype"),
+        "AFS_INDIVIDUAL_ID",
+    ).filter(F.col("cw_type") == cw_type)
+    if cw_subtype is not None:
+        cw_filtered = cw_filtered.filter(F.col("cw_subtype") == cw_subtype)
+    cw_filtered = cw_filtered.select("cw_id", "AFS_INDIVIDUAL_ID")
+
+    joined = cc_slice.join(cw_filtered, cc_slice["match_value"] == cw_filtered["cw_id"], "left")
+
+    return joined.groupBy("id", "type", "component", "component_size").agg(
+        F.collect_set("AFS_INDIVIDUAL_ID").alias("afs_individual_ids")
+    )
+
+
+@stage_dataframe(write_format="parquet")
+def affinity_enhanced_components_fn(result_df, matched_parts, spark=None, write_path=None):
+    """
+    The one deliverable table: every row of `result` (all 6 types) plus
+    `afs_individual_ids`/`has_afs_id`. The 3 eligible types come from
+    `matched_parts` (already matched + collapsed above); the other 3 just
+    get an empty array directly -- never joined to the crosswalk.
+    """
+    matched = matched_parts[0]
+    for part in matched_parts[1:]:
+        matched = matched.unionByName(part)
+
+    unmapped = result_df.filter(~F.col("type").isin(AFFINITY_TYPES)).withColumn(
+        "afs_individual_ids", F.array().cast("array<string>")
+    )
+
+    full = matched.unionByName(unmapped)
+    return full.withColumn("has_afs_id", F.size(F.col("afs_individual_ids")) > 0)
+
+
+affinity_matched_parts = [
+    affinity_match_one_type_fn(
+        result,
+        affinity_cw,
+        cc_type,
+        cw_type,
+        cw_subtype,
+        spark=spark,
+        write_path=f"{CC_OUTPUT_PATH}/affinity_matched_{cc_type.lower()}",
+    )
+    for cc_type, cw_type, cw_subtype in AFFINITY_TYPE_MAP
+]
+affinity_enhanced_components = affinity_enhanced_components_fn(
+    result,
+    affinity_matched_parts,
+    spark=spark,
+    write_path=f"{CC_OUTPUT_PATH}/affinity_enhanced_components",
+)
+
+print("--- nodes with an AFS id, by type ---")
+affinity_enhanced_components.groupBy("type").agg(
+    F.count("*").alias("n_nodes"), F.sum(F.col("has_afs_id").cast("int")).alias("n_with_afs_id")
+).withColumn(
+    "pct_with_afs_id", F.round(100 * F.col("n_with_afs_id") / F.col("n_nodes"), 2)
+).orderBy(
+    F.desc("n_with_afs_id")
+).show(truncate=False)
+
+# COMMAND ----------
+
+# MAGIC %md ### Component targetability by size bucket
+# MAGIC Three separate tables, one per targetability definition:
+# MAGIC - **any** -- >=1 node of any affinity-eligible type has an AFS id.
+# MAGIC - **hem** -- >=1 `HEM_MD5` node has an AFS id.
+# MAGIC - **maid** -- >=1 `HARDWARE_ANDROID_AD_ID`/`HARDWARE_IDFA` node has an AFS
+# MAGIC   id (android and ios share one "maid" definition, same grouping used
+# MAGIC   everywhere else in this project).
+# MAGIC
+# MAGIC All three share the identical 27-row bucket structure and `n_components`
+# MAGIC per bucket (bucketed the same way as the raw component-size histogram
+# MAGIC earlier in this notebook: 1-20 exact, doubling-width bins to 1024, giant
+# MAGIC separate) -- only `n_targetable_components`/`pct_targetable` differ by
+# MAGIC definition. Sanity check once real numbers are in: `any` should be >=
+# MAGIC both `hem` and `maid` at every bucket, and <= their sum (a component can
+# MAGIC be targetable via both at once, `any` only counts it once).
+# MAGIC
+# MAGIC `component_affinity_flags_fn` computes all three flags in one
+# MAGIC `groupBy("component")` (staged once); `component_targetability_by_size_bucket_fn`
+# MAGIC is called 3x against it, once per definition, each with its own
+# MAGIC `write_path` -- independently resumable, same as everything else staged
+# MAGIC in this notebook.
+
+# COMMAND ----------
+
+
+@stage_dataframe(write_format="parquet")
+def component_affinity_flags_fn(enhanced_df, spark=None, write_path=None):
+    """Per component: component_size + the three targetability flags
+    (any/hem/maid). Staged once since all three bucketed tables below read
+    from this same table."""
+    return enhanced_df.groupBy("component").agg(
+        F.first("component_size").alias("component_size"),
+        F.max(F.col("has_afs_id").cast("int")).alias("targetable_any"),
+        F.max(
+            F.when(F.col("type") == "HEM_MD5", F.col("has_afs_id").cast("int")).otherwise(0)
+        ).alias("targetable_hem"),
+        F.max(
+            F.when(
+                F.col("type").isin("HARDWARE_ANDROID_AD_ID", "HARDWARE_IDFA"),
+                F.col("has_afs_id").cast("int"),
+            ).otherwise(0)
+        ).alias("targetable_maid"),
+    )
+
+
+def _bucket_component_size(df):
+    """Shared bucketing expression -- same geometric buckets as
+    type_mix_by_size_bucket_fn above. Not staged on its own: just
+    withColumn, no shuffle, always used immediately before a groupBy."""
+    return df.withColumn(
+        "bucket_order",
+        F.when(F.col("component_size") <= 20, F.col("component_size"))
+        .when(F.col("component_size") <= 32, F.lit(21))
+        .when(F.col("component_size") <= 64, F.lit(33))
+        .when(F.col("component_size") <= 128, F.lit(65))
+        .when(F.col("component_size") <= 256, F.lit(129))
+        .when(F.col("component_size") <= 512, F.lit(257))
+        .when(F.col("component_size") <= 1024, F.lit(513))
+        .otherwise(F.lit(999999999)),
+    ).withColumn(
+        "size_bucket",
+        F.when(F.col("component_size") <= 20, F.col("component_size").cast("string"))
+        .when(F.col("component_size") <= 32, F.lit("21-32"))
+        .when(F.col("component_size") <= 64, F.lit("33-64"))
+        .when(F.col("component_size") <= 128, F.lit("65-128"))
+        .when(F.col("component_size") <= 256, F.lit("129-256"))
+        .when(F.col("component_size") <= 512, F.lit("257-512"))
+        .when(F.col("component_size") <= 1024, F.lit("513-1024"))
+        .otherwise(F.lit("giant (>1024)")),
+    )
+
+
+@stage_dataframe(write_format="parquet")
+def component_targetability_by_size_bucket_fn(flags_df, targetable_col, spark=None, write_path=None):
+    bucketed = _bucket_component_size(flags_df)
+    return (
+        bucketed.groupBy("bucket_order", "size_bucket")
+        .agg(
+            F.count("*").alias("n_components"),
+            F.sum(targetable_col).alias("n_targetable_components"),
+        )
+        .withColumn("n_not_targetable", F.col("n_components") - F.col("n_targetable_components"))
+        .withColumn(
+            "pct_targetable", F.round(100 * F.col("n_targetable_components") / F.col("n_components"), 2)
+        )
+    )
+
+
+component_affinity_flags = component_affinity_flags_fn(
+    affinity_enhanced_components, spark=spark, write_path=f"{CC_OUTPUT_PATH}/component_affinity_flags"
+)
+
+component_targetability_any = component_targetability_by_size_bucket_fn(
+    component_affinity_flags,
+    "targetable_any",
+    spark=spark,
+    write_path=f"{CC_OUTPUT_PATH}/component_targetability_any",
+)
+component_targetability_hem = component_targetability_by_size_bucket_fn(
+    component_affinity_flags,
+    "targetable_hem",
+    spark=spark,
+    write_path=f"{CC_OUTPUT_PATH}/component_targetability_hem",
+)
+component_targetability_maid = component_targetability_by_size_bucket_fn(
+    component_affinity_flags,
+    "targetable_maid",
+    spark=spark,
+    write_path=f"{CC_OUTPUT_PATH}/component_targetability_maid",
+)
+
+for _label, _table in [
+    ("any", component_targetability_any),
+    ("hem", component_targetability_hem),
+    ("maid", component_targetability_maid),
+]:
+    print(f"--- components targetable via affinity ({_label}), by size bucket ---")
+    print(
+        _table.orderBy("bucket_order")
+        .toPandas()
+        .set_index("size_bucket")[
+            ["n_components", "n_targetable_components", "n_not_targetable", "pct_targetable"]
+        ]
+        .to_string()
+    )
+    print()
+
+# COMMAND ----------
+
 
 # MAGIC %md ## Per-type summary
 # MAGIC Broken into staged sub-tables (totals, conn_identities, degree_counts) before

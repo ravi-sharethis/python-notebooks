@@ -1,0 +1,454 @@
+<title>IDGraph3 — Affinity Targetability</title>
+<style>
+  :root {
+    --bg: #EEF1F3; --surface: #FFFFFF; --surface-2: #F6F8F9;
+    --ink: #1B232C; --ink-muted: #5B6B78; --ink-faint: #8A96A1;
+    --accent: #C77D32; --accent-ink: #7A4A17;
+    --accent2: #3E7C8C; --accent2-ink: #255763;
+    --critical: #B23A3A; --critical-bg: #FBEEEC;
+    --good: #1F7A33; --good-ink: #1F7A33; --good-bg: #EAF6EC;
+    --grid: #DEE4E8; --border: #E0E5E9;
+    --shadow: 0 1px 2px rgba(27,35,44,0.04), 0 8px 24px -12px rgba(27,35,44,0.12);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #10151A; --surface: #171E25; --surface-2: #1C242C;
+      --ink: #E8EDF1; --ink-muted: #8CA0AE; --ink-faint: #5E707C;
+      --accent: #E0A057; --accent-ink: #F3D2A3;
+      --accent2: #6FB8CC; --accent2-ink: #A9DCE8;
+      --critical: #E0867A; --critical-bg: #2B1A19;
+      --good: #6FCF6F; --good-ink: #9BE39B; --good-bg: #16261A;
+      --grid: #2A333C; --border: #273039;
+      --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 24px -12px rgba(0,0,0,0.5);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #10151A; --surface: #171E25; --surface-2: #1C242C;
+    --ink: #E8EDF1; --ink-muted: #8CA0AE; --ink-faint: #5E707C;
+    --accent: #E0A057; --accent-ink: #F3D2A3;
+    --accent2: #6FB8CC; --accent2-ink: #A9DCE8;
+    --critical: #E0867A; --critical-bg: #2B1A19;
+    --good: #6FCF6F; --good-ink: #9BE39B; --good-bg: #16261A;
+    --grid: #2A333C; --border: #273039;
+  }
+  :root[data-theme="light"] {
+    --bg: #EEF1F3; --surface: #FFFFFF; --surface-2: #F6F8F9;
+    --ink: #1B232C; --ink-muted: #5B6B78; --ink-faint: #8A96A1;
+    --accent: #C77D32; --accent-ink: #7A4A17;
+    --accent2: #3E7C8C; --accent2-ink: #255763;
+    --critical: #B23A3A; --critical-bg: #FBEEEC;
+    --good: #1F7A33; --good-ink: #1F7A33; --good-bg: #EAF6EC;
+    --grid: #DEE4E8; --border: #E0E5E9;
+  }
+  * { box-sizing: border-box; }
+  html,body { margin:0; padding:0; }
+  body { background:var(--bg); color:var(--ink); font-family:-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; line-height:1.5; }
+  .page { max-width:1180px; margin:0 auto; padding:48px 24px 80px; display:flex; flex-direction:column; gap:36px; }
+  .eyebrow { font-family:"SF Mono","Cascadia Code",Consolas,monospace; font-size:12px; letter-spacing:.08em; text-transform:uppercase; color:var(--ink-faint); }
+  h1 { font-family:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,serif; font-weight:600; font-size:clamp(26px,4vw,34px); line-height:1.15; margin:6px 0 4px; text-wrap:balance; }
+  h2 { font-family:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,serif; font-weight:600; font-size:20px; margin:0 0 4px; }
+  h3 { font-family:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,serif; font-weight:600; font-size:16px; margin:0 0 10px; }
+  .subtitle { font-size:15px; color:var(--ink-muted); max-width:72ch; }
+  section { display:flex; flex-direction:column; gap:14px; }
+  .section-note { font-size:13px; color:var(--ink-muted); max-width:80ch; }
+  .unit-tag { font-family:"SF Mono",monospace; font-size:10px; padding:2px 7px; border-radius:5px; font-weight:600; letter-spacing:.04em; border:1px solid var(--border); color:var(--ink-muted); background:var(--surface-2); margin-left:9px; vertical-align:1px; text-transform:uppercase; }
+  .def-tag { font-family:"SF Mono",monospace; font-size:11px; padding:2px 8px; border-radius:5px; font-weight:600; }
+  .def-any { background: color-mix(in srgb, var(--accent) 20%, transparent); color: var(--accent-ink); }
+  .def-hem { background: color-mix(in srgb, var(--accent2) 20%, transparent); color: var(--accent2-ink); }
+  .def-maid { background: color-mix(in srgb, var(--good) 18%, transparent); color: var(--good-ink); }
+  /* config-tag (32/10 vs 16/6) deliberately neutral, not accent-colored -- those hues already
+     mean any/hem/maid in this report. Solid vs dashed border instead, echoing the
+     solid=32/10 / dashed=16/6 line convention used in the charts. */
+  .config-tag { font-family:"SF Mono",monospace; font-size:11px; padding:1px 7px; border-radius:5px; font-weight:600; color:var(--ink-muted); background:var(--surface-2); }
+  .tag-32 { border:1.5px solid var(--ink-faint); }
+  .tag-16 { border:1.5px dashed var(--ink-faint); }
+  .stat-strip { display:grid; grid-template-columns: repeat(4,1fr); gap:14px; }
+  @media (max-width:900px) { .stat-strip { grid-template-columns: repeat(2,1fr); } }
+  .two-col { display:grid; grid-template-columns: 1fr 1fr; gap:16px; }
+  @media (max-width:900px) { .two-col { grid-template-columns: 1fr; } }
+  .grid-caption { font-family:"SF Mono",monospace; font-size:11px; color:var(--ink-faint); margin-bottom:6px; text-transform:uppercase; letter-spacing:.03em; }
+  .stat-card { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:16px 18px; box-shadow:var(--shadow); }
+  .stat-card.critical { border-color: color-mix(in srgb, var(--critical) 35%, var(--border)); background:var(--critical-bg); }
+  .stat-label { font-size:12px; letter-spacing:.04em; text-transform:uppercase; color:var(--ink-muted); margin-bottom:6px; }
+  .stat-card.critical .stat-label { color:var(--critical); }
+  .stat-value { font-family:"SF Mono",monospace; font-variant-numeric:tabular-nums; font-size:clamp(17px,2.2vw,21px); font-weight:600; }
+  .stat-card.critical .stat-value { color:var(--critical); }
+  .stat-sub { font-size:12px; color:var(--ink-faint); margin-top:3px; }
+  .card { background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:20px; box-shadow:var(--shadow); }
+  .table-scroll { overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; font-size:12.5px; font-family:"SF Mono","Cascadia Code",Consolas,monospace; }
+  th,td { text-align:right; padding:5px 9px; border-bottom:1px solid var(--border); font-variant-numeric:tabular-nums; white-space:nowrap; }
+  th:first-child, td:first-child { text-align:left; }
+  th { color:var(--ink-faint); font-weight:600; text-transform:uppercase; font-size:10px; letter-spacing:.04em; position:sticky; top:0; background:var(--surface); }
+  tr.highlight td { background: color-mix(in srgb, var(--accent) 7%, transparent); }
+  .legend { display:flex; flex-wrap:wrap; gap:12px 18px; font-size:12px; color:var(--ink-muted); margin-top:8px; }
+  .legend-item { display:flex; align-items:center; gap:6px; }
+  .legend-swatch { width:12px; height:3px; border-radius:2px; flex-shrink:0; }
+  ul.findings { margin:0; padding-left:20px; display:flex; flex-direction:column; gap:10px; }
+  ul.findings li { font-size:14px; }
+  ul.findings b { color: var(--ink); }
+  .caveat-box { border:1px dashed var(--border); border-radius:10px; padding:14px 16px; font-size:13px; color:var(--ink-muted); background:var(--surface-2); }
+  .caveat-box ul { margin:6px 0 0; padding-left:18px; }
+  footer { font-size:12px; color:var(--ink-faint); max-width:80ch; }
+  code { font-family:"SF Mono",Consolas,monospace; background:var(--surface-2); padding:1px 5px; border-radius:4px; font-size:.95em; }
+  svg { display:block; max-width:100%; }
+</style>
+
+<div class="page">
+  <div>
+    <div class="eyebrow">IDGraph3 · 32/10 vs 16/6 · affinity crosswalk match</div>
+    <h1>How much of the graph is actually targetable?</h1>
+    <div class="subtitle">Real run against the DCR affinity crosswalk (<code>all_id_to_afs_id</code>, refresh 20261008), joined onto both connected-components configs — <span class="config-tag tag-32">32/10</span> and <span class="config-tag tag-16">16/6</span>. Measures how component targetability changes with component size, and whether tightening the threshold config changes the answer.</div>
+  </div>
+
+  <section>
+    <h2>Methodology, briefly</h2>
+    <div class="section-note">
+    Only 3 of the graph's 6 node types have any affinity crosswalk coverage at all: <code>HEM_MD5</code> (hashed email) and the two "maids" — <code>HARDWARE_ANDROID_AD_ID</code> and <code>HARDWARE_IDFA</code>. <code>ID5_UID</code>/<code>TTD</code>/<code>ST</code> are never joined against the crosswalk — it has no entries for them. A node is <b>targetable</b> if the crosswalk maps it to at least one <code>AFS_INDIVIDUAL_ID</code> (a node can map to more than one). A <b>component is targetable</b> if <i>any</i> node inside it is — so a component built entirely out of untargetable types can still be targetable via a single matched neighbor, and conversely a component full of eligible-type nodes is still untargetable if none of them actually matched the crosswalk. Three targetability definitions are tracked throughout: <span class="def-tag def-any">any</span> (via any of the 3 eligible types), <span class="def-tag def-hem">hem</span> (via <code>HEM_MD5</code> specifically), and <span class="def-tag def-maid">maid</span> (via either mobile ad ID). This run compares both MAX_FANOUT/STAR_THRESHOLD configs from the Threshold Comparison Report — <span class="config-tag tag-32">32/10</span> (looser) and <span class="config-tag tag-16">16/6</span> (stricter).
+    </div>
+  </section>
+
+  <section>
+    <h2>Headline numbers</h2>
+    <div class="stat-strip">
+      <div class="stat-card critical">
+        <div class="stat-label">Targetable components (any)</div>
+        <div class="stat-value"><span class="config-tag tag-32">32/10</span> 4.04% <span style="color:var(--ink-faint);font-weight:400;">·</span> <span class="config-tag tag-16">16/6</span> 4.80%</div>
+        <div class="stat-sub">59,711,770 of 1,478,773,504 (32/10) · 131,018,980 of 2,728,350,341 (16/6) — in both configs, the overwhelming majority of the graph has no affinity reach at all</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Node match rate, by type (16/6)</div>
+        <div class="stat-value" style="font-size:14px;line-height:1.6;">
+          HEM_MD5 <b>19.80%</b><br>
+          IDFA <b>6.70%</b> · AAID <b>6.16%</b>
+        </div>
+        <div class="stat-sub">node-level, not component-level; 32/10 node-level rates not yet run</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Singletons targetable (any)</div>
+        <div class="stat-value"><span class="config-tag tag-32">32/10</span> 2.96% <span style="color:var(--ink-faint);font-weight:400;">·</span> <span class="config-tag tag-16">16/6</span> 3.99%</div>
+        <div class="stat-sub">singletons are 83.1%/88.6% of all components respectively, so this one number drives most of each config's headline rate</div>
+      </div>
+      <div class="stat-card critical">
+        <div class="stat-label">513-1024 bucket, targetable (any)</div>
+        <div class="stat-value"><span class="config-tag tag-32">32/10</span> 0.00% <span style="color:var(--ink-faint);font-weight:400;">·</span> <span class="config-tag tag-16">16/6</span> 96.94%</div>
+        <div class="stat-sub">0 of 6 components at 32/10 — see findings, the known TTD-outlier connection</div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Key findings</h2>
+    <ul class="findings">
+      <li><b>16/6 is more targetable than 32/10 at every single size bucket</b>, not just overall — 4.80% vs 4.04% (any) in aggregate, but the gap is tiny at small sizes (singletons: 3.99% vs 2.96%) and enormous at large ones. Tightening the threshold config doesn't just change the graph's shape (the subject of the Threshold Comparison Report) — it directly improves how much of the graph is reachable for targeting.</li>
+      <li><b>The 513-1024 TTD-outlier connection is now confirmed, not just plausible.</b> At 32/10, the 513-1024 bucket is <b>0.00% targetable</b> (0 of 6 components, in all three of any/hem/maid) and 257-512 craters to 13.33% (any) — vs. 96.94%/99.22% at 16/6. This is exactly the size range (and exactly the config) where <code>idgraph3_top5_components_by_type.csv</code> already identified specific near-giant components that are 100% TTD (size 617) or TTD+ID5_UID only (size 782) — <i>structurally</i> incapable of matching the crosswalk, since TTD/ID5_UID have zero affinity coverage. This is also the same 257-512/513-1024 range the Threshold Comparison Report already flagged as a TTD-dominance pathology at 32/10 that's "completely gone" at 16/6 — three independent analyses now point at the same mechanism.</li>
+      <li><b>Targetability rises steadily and almost monotonically with component size</b> in both configs — e.g. at 16/6: 3.99% of singletons, up through 52.77% at 21-32, 92.35% at 65-128, to 100% for the giant component. Bigger components simply have more chances of containing one of the 3 eligible types with an actual crosswalk match — except where the TTD pathology above breaks it.</li>
+      <li><b>But singletons dominate the absolute volume of untargetable components</b>, in both configs. At 16/6, singletons alone contribute 2,321,821,874 untargetable components — 89.4% of all 2,597,331,361 untargetable components in the entire graph. Improving targetability at any other size bucket barely moves the overall number.</li>
+      <li><b>The size-16 id5 anomaly is confirmed a 4th independent time, now in this new metric.</b> <span class="def-tag def-any">any</span> dips from 36.42% (size 15) to 34.68% (size 16) before recovering to 40.43% (size 17) at 16/6 — the same shape at 32/10 (32.30%→29.06%→35.98%) and in <span class="def-tag def-hem">hem</span>/<span class="def-tag def-maid">maid</span> under both configs. This can't be a <code>MAX_FANOUT</code>-boundary coincidence — it recurs at size 16 whether <code>MAX_FANOUT</code> is 16 or 32. The simple explanation (more ID5_UID at 16 crowding out eligible types) doesn't fully fit either config's shape — the real mechanism is still open.</li>
+      <li><b><code>hem</code> and <code>maid</code> trade the lead twice</b> in both configs — <code>maid</code> ahead at singletons, <code>hem</code> takes over at small-to-mid sizes, <code>maid</code> retakes the lead through most of the range, with a final flip right at the small-sample tail.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Raw vs. targetable components, by size bucket</h2>
+    <div class="section-note">Absolute magnitude, not %, shown per config. <b>Raw</b> is the full component-size distribution — identical to the pre-affinity histograms published separately in the Threshold Comparison Report (same exact-size source, same geometric bucketing; note the two configs' y-axes differ, 32/10 tops out lower since its MAX_FANOUT=32 means a smaller, differently-shaped graph overall). <b>Targetable (any)</b> and <b>targetable (hem)</b> are subsets of each bar. % alone (next chart) hides this: singletons have one of the lowest targetable <i>rates</i> in both configs, but by far the largest absolute gap between raw and targetable.</div>
+    <div class="two-col">
+      <div class="card">
+        <div class="grid-caption"><span class="config-tag tag-32">32/10</span></div>
+        <div class="table-scroll"><svg id="rawVsTargetableChart32" width="1100" height="420" viewBox="0 0 1100 420"></svg></div>
+      </div>
+      <div class="card">
+        <div class="grid-caption"><span class="config-tag tag-16">16/6</span></div>
+        <div class="table-scroll"><svg id="rawVsTargetableChart16" width="1100" height="420" viewBox="0 0 1100 420"></svg></div>
+      </div>
+    </div>
+    <div class="legend">
+      <div class="legend-item"><span class="legend-swatch" style="background:var(--ink-faint);height:12px;border-radius:3px;"></span>raw (all components)</div>
+      <div class="legend-item"><span class="legend-swatch" style="background:var(--accent);height:12px;border-radius:3px;"></span>targetable (any)</div>
+      <div class="legend-item"><span class="legend-swatch" style="background:var(--accent2);height:12px;border-radius:3px;"></span>targetable (hem)</div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Cumulative components vs. targetable components</h2>
+    <div class="section-note">Ascending by size: running total of <i>all</i> components (raw, left axis) vs. <i>targetable</i> components under the any/hem definitions (right axis, shared scale), up to and including a given size — both configs overlaid (solid=32/10, dashed=16/6). <b>Two different scales</b> — the left axis tops out at 3.0B, the right axis at 150M — so read each line against its own axis color; where the lines sit relative to each other is not meaningful, only each one's own shape. Both configs' lines sit well within those same two scales (32/10 tops out lower on both, since it's a smaller graph with fewer targetable components overall). Counterintuitive given the rate chart below: at 16/6, singletons are only 3.99% targetable (any) individually, but there are so many of them that they alone already account for <b>96,485,609</b> of the <b>131,018,980</b> any-targetable components in the whole graph — every line here is already most of the way to its own final total by size 1.</div>
+    <div class="card">
+      <div class="table-scroll"><svg id="cumChart" width="1100" height="380" viewBox="0 0 1100 380"></svg></div>
+      <div class="legend">
+        <div class="legend-item"><span class="legend-swatch" style="background:var(--ink-faint);height:3px;"></span>raw (all components) — left axis</div>
+        <div class="legend-item"><span class="legend-swatch" style="background:var(--accent);height:3px;"></span>targetable (any) — right axis</div>
+        <div class="legend-item"><span class="legend-swatch" style="background:var(--accent2);height:3px;"></span>targetable (hem) — right axis</div>
+        <div class="legend-item" style="color:var(--ink-faint);">(solid=32/10, dashed=16/6)</div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Targetability by component size</h2>
+    <div class="section-note">% of components in each size bucket that are targetable, under each of the 3 definitions, both configs overlaid (solid=32/10, dashed=16/6 — same convention as the Threshold Comparison Report's CDF chart). Log-scale x-axis positions match the bucket structure used throughout this project (1–20 exact, doubling-width bins to 1024, giant separate). 16/6 (dashed) sits above 32/10 (solid) almost everywhere, most dramatically at 257-512/513-1024 where 32/10 collapses toward 0%.</div>
+    <div class="card">
+      <div class="table-scroll"><svg id="pctChart" width="1100" height="420" viewBox="0 0 1100 420"></svg></div>
+      <div class="legend" id="pctLegend"></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Full breakdown, by size bucket</h2>
+    <div class="section-note"><code>n_components</code> is identical across all three definitions within a config (it's just that config's raw component-size histogram) — only the targetable counts/percentages differ by definition. The two tables use <i>different</i> <code>n_components</code> columns from each other, since 32/10 and 16/6 are different graphs.</div>
+    <div class="two-col">
+      <div class="card table-scroll">
+        <div class="grid-caption"><span class="config-tag tag-32">32/10</span></div>
+        <table>
+          <thead>
+            <tr>
+              <th>size</th><th>n_components</th>
+              <th style="color:var(--accent-ink)">any targetable</th><th style="color:var(--accent-ink)">any %</th>
+              <th style="color:var(--accent2-ink)">hem targetable</th><th style="color:var(--accent2-ink)">hem %</th>
+              <th style="color:var(--good-ink)">maid targetable</th><th style="color:var(--good-ink)">maid %</th>
+            </tr>
+          </thead>
+          <tbody id="fullTableBody32"></tbody>
+        </table>
+      </div>
+      <div class="card table-scroll">
+        <div class="grid-caption"><span class="config-tag tag-16">16/6</span></div>
+        <table>
+          <thead>
+            <tr>
+              <th>size</th><th>n_components</th>
+              <th style="color:var(--accent-ink)">any targetable</th><th style="color:var(--accent-ink)">any %</th>
+              <th style="color:var(--accent2-ink)">hem targetable</th><th style="color:var(--accent2-ink)">hem %</th>
+              <th style="color:var(--good-ink)">maid targetable</th><th style="color:var(--good-ink)">maid %</th>
+            </tr>
+          </thead>
+          <tbody id="fullTableBody16"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Caveats</h2>
+    <div class="caveat-box">
+      <ul>
+        <li>Single run, single refresh date (<code>20261008</code>) — no time-series yet on whether match rates drift between crosswalk refreshes.</li>
+        <li>Node-level match rates by type (HEM_MD5 19.80%, IDFA 6.70%, AAID 6.16%) are only run for 16/6 so far — the 32/10 node-level breakdown hasn't been pulled, only the component-level roll-up above.</li>
+        <li>The size-16 anomaly's mechanism in this metric isn't fully explained in either config — eligible-type node share declines monotonically across sizes 15→17 (16/6) while targetability dips then recovers at 16→17, so a pure composition-share story doesn't account for the shape. Would need a direct query against <code>component_affinity_flags</code> (fraction of size-16 vs. 15/17 components with zero eligible-type nodes at all) to settle.</li>
+        <li>The 513-1024 collapse is now well-evidenced at 32/10 (0 of 6 components targetable, tied to specific known TTD-saturated components) but the 16/6 version is still a small-sample dip (~3 of 98 components) — don't conflate the two; only the 32/10 one is confirmed rather than plausible.</li>
+        <li><code>hem</code>/<code>maid</code> crossover and the smallest buckets' near-ties (as low as 1–98 components) shouldn't be read as a stable trend in either config.</li>
+        <li>This only measures whether a component <i>can</i> be targeted at all (≥1 AFS id reachable) — not reach quality, audience size per targetable component, or how many distinct AFS ids a multiply-matched component actually carries (recorded per-node in <code>affinity_enhanced_components.afs_individual_ids</code>, not yet rolled up here).</li>
+      </ul>
+    </div>
+  </section>
+
+  <footer>Generated from IDGraph3 <code>connectedComponents()</code> output (both 32/10 and 16/6 configs) joined against the DCR affinity crosswalk. See <code>IDGraph_Journal.md</code> §10 in the python-notebooks repo for full narrative, and <code>idgraph3_component_targetability_{any,hem,maid}[_32_10].csv</code> for the raw numbers.</footer>
+</div>
+
+<script>
+const chartData = {"buckets": ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21-32", "33-64", "65-128", "129-256", "257-512", "513-1024", "giant (>1024)"], "any_n_components": [2418307483, 108412090, 51291720, 31302612, 21972127, 16864550, 13119537, 10557910, 8590900, 7136705, 6005506, 5157797, 4491255, 3945719, 3497090, 3466623, 1567530, 1286943, 1087212, 940404, 5946202, 2796018, 525894, 75003, 5412, 98, 1], "any_n_targetable": [96485609, 1408028, 1980272, 2303170, 2399170, 2338404, 2204497, 2046323, 1892961, 1751697, 1627449, 1526416, 1441676, 1352917, 1273609, 1202285, 633774, 533290, 465055, 416656, 3137630, 2032918, 485656, 74052, 5370, 95, 1], "any_pct": [3.99, 1.3, 3.86, 7.36, 10.92, 13.87, 16.8, 19.38, 22.03, 24.54, 27.1, 29.59, 32.1, 34.29, 36.42, 34.68, 40.43, 41.44, 42.78, 44.31, 52.77, 72.71, 92.35, 98.73, 99.22, 96.94, 100.0], "hem_n_targetable": [40252808, 927501, 1342544, 1568174, 1622573, 1560419, 1447258, 1323380, 1205834, 1103687, 1016908, 946152, 890568, 831152, 780525, 736458, 392643, 331690, 292303, 263746, 2065923, 1465810, 407362, 70310, 5334, 95, 1], "hem_pct": [1.66, 0.86, 2.62, 5.01, 7.38, 9.25, 11.03, 12.53, 14.04, 15.46, 16.93, 18.34, 19.83, 21.06, 22.32, 21.24, 25.05, 25.77, 26.89, 28.05, 34.74, 52.42, 77.46, 93.74, 98.56, 96.94, 100.0], "maid_n_targetable": [56232801, 543934, 807712, 1010609, 1130997, 1178387, 1175229, 1143306, 1099968, 1048275, 997713, 953305, 913253, 870535, 830836, 792828, 404677, 340632, 297469, 267474, 2080594, 1496887, 415045, 70849, 5343, 94, 1], "maid_pct": [2.33, 0.5, 1.57, 3.23, 5.15, 6.99, 8.96, 10.83, 12.8, 14.69, 16.61, 18.48, 20.33, 22.06, 23.76, 22.87, 25.82, 26.47, 27.36, 28.44, 34.99, 53.54, 78.92, 94.46, 98.73, 95.92, 100.0], "cum_components": [2418307483, 2526719573, 2578011293, 2609313905, 2631286032, 2648150582, 2661270119, 2671828029, 2680418929, 2687555634, 2693561140, 2698718937, 2703210192, 2707155911, 2710653001, 2714119624, 2715687154, 2716974097, 2718061309, 2719001713, 2724947915, 2727743933, 2728269827, 2728344830, 2728350242, 2728350340, 2728350341], "cum_targetable_any": [96485609, 97893637, 99873909, 102177079, 104576249, 106914653, 109119150, 111165473, 113058434, 114810131, 116437580, 117963996, 119405672, 120758589, 122032198, 123234483, 123868257, 124401547, 124866602, 125283258, 128420888, 130453806, 130939462, 131013514, 131018884, 131018979, 131018980], "cum_targetable_hem": [40252808, 41180309, 42522853, 44091027, 45713600, 47274019, 48721277, 50044657, 51250491, 52354178, 53371086, 54317238, 55207806, 56038958, 56819483, 57555941, 57948584, 58280274, 58572577, 58836323, 60902246, 62368056, 62775418, 62845728, 62851062, 62851157, 62851158], "any_n_components_32": [1228969090, 95007081, 42018795, 25040340, 17345491, 13060526, 9919559, 7757636, 6103102, 4880009, 3931592, 3216822, 2652206, 2216165, 1871500, 1881489, 1376549, 1213222, 1070644, 952980, 6215935, 1893731, 175936, 3067, 30, 6, 1], "any_n_targetable_32": [36360778, 1220674, 1619129, 1807737, 1805886, 1686266, 1521751, 1350836, 1193733, 1053398, 934021, 836172, 749602, 670890, 604412, 546708, 495342, 451915, 411573, 375067, 2736843, 1147441, 128925, 2666, 4, 0, 1], "any_pct_32": [2.96, 1.28, 3.85, 7.22, 10.41, 12.91, 15.34, 17.41, 19.56, 21.59, 23.76, 25.99, 28.26, 30.27, 32.3, 29.06, 35.98, 37.25, 38.44, 39.36, 44.03, 60.59, 73.28, 86.93, 13.33, 0.0, 100.0], "hem_n_targetable_32": [13566915, 846113, 1139845, 1277324, 1269604, 1170718, 1040770, 910907, 793373, 691681, 608323, 540067, 482446, 429576, 386077, 348181, 315584, 287674, 262188, 239245, 1765746, 817735, 102999, 2421, 3, 0, 1], "hem_pct_32": [1.1, 0.89, 2.71, 5.1, 7.32, 8.96, 10.49, 11.74, 13.0, 14.17, 15.47, 16.79, 18.19, 19.38, 20.63, 18.51, 22.93, 23.71, 24.49, 25.1, 28.41, 43.18, 58.54, 78.94, 10.0, 0.0, 100.0], "maid_n_targetable_32": [22793863, 425669, 613593, 740751, 797289, 798190, 763346, 711700, 654812, 595968, 542294, 494864, 450068, 409259, 373790, 342024, 312999, 287804, 264762, 242690, 1832329, 788485, 94986, 2297, 3, 0, 1], "maid_pct_32": [1.85, 0.45, 1.46, 2.96, 4.6, 6.11, 7.7, 9.17, 10.73, 12.21, 13.79, 15.38, 16.97, 18.47, 19.97, 18.18, 22.74, 23.72, 24.73, 25.47, 29.48, 41.64, 53.99, 74.89, 10.0, 0.0, 100.0], "cum_components_32": [1228969090, 1323976171, 1365994966, 1391035306, 1408380797, 1421441323, 1431360882, 1439118518, 1445221620, 1450101629, 1454033221, 1457250043, 1459902249, 1462118414, 1463989914, 1465871403, 1467247952, 1468461174, 1469531818, 1470484798, 1476700733, 1478594464, 1478770400, 1478773467, 1478773497, 1478773503, 1478773504], "cum_targetable_any_32": [36360778, 37581452, 39200581, 41008318, 42814204, 44500470, 46022221, 47373057, 48566790, 49620188, 50554209, 51390381, 52139983, 52810873, 53415285, 53961993, 54457335, 54909250, 55320823, 55695890, 58432733, 59580174, 59709099, 59711765, 59711769, 59711769, 59711770], "cum_targetable_hem_32": [13566915, 14413028, 15552873, 16830197, 18099801, 19270519, 20311289, 21222196, 22015569, 22707250, 23315573, 23855640, 24338086, 24767662, 25153739, 25501920, 25817504, 26105178, 26367366, 26606611, 28372357, 29190092, 29293091, 29295512, 29295515, 29295515, 29295516]};
+
+function el(tag, attrs) {
+  const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  return e;
+}
+function fmt(n) { return n.toLocaleString('en-US'); }
+
+// ---- raw vs targetable (any, hem), log-scale triple bars -- one config per call ----
+function drawRawVsTargetable(svgId, a, b, c) {
+  const svg = document.getElementById(svgId);
+  const W = 1100, H = 420, mL = 70, mR = 10, mT = 14, mB = 60;
+  const plotW = W - mL - mR, plotH = H - mT - mB;
+  const buckets = chartData.buckets;
+  const yMax = Math.max(...a, ...b, ...c, 1);
+  const yMin = 1;
+  const logMin = Math.log10(yMin), logMax = Math.log10(yMax*1.3);
+  function yFor(v) {
+    const l = Math.log10(Math.max(v,1));
+    return mT + plotH * (1 - (l-logMin)/(logMax-logMin));
+  }
+  for (let p=0; p<=10; p++) {
+    const v = Math.pow(10,p);
+    if (v > yMax*1.3) break;
+    const y = yFor(v);
+    svg.appendChild(el('line',{x1:mL,x2:W-mR,y1:y,y2:y,stroke:'var(--grid)','stroke-width':1}));
+    const label = v>=1e9?(v/1e9)+'B':v>=1e6?(v/1e6)+'M':v>=1e3?(v/1e3)+'K':String(v);
+    const t = el('text',{x:mL-8,y:y+3,'text-anchor':'end','font-size':10,fill:'var(--ink-faint)','font-family':'monospace'});
+    t.textContent = label; svg.appendChild(t);
+  }
+  const n = buckets.length;
+  const groupW = plotW/n, barW = groupW*0.27, gap=groupW*0.045;
+  buckets.forEach((bk,i) => {
+    const x0 = mL + i*groupW;
+    const ya = yFor(a[i]), yb = yFor(b[i]), yc = yFor(c[i]);
+    const r1 = el('rect',{x:x0+gap, y:ya, width:barW, height:(H-mB)-ya, fill:'var(--ink-faint)', rx:1});
+    const r2 = el('rect',{x:x0+gap+barW+2, y:yb, width:barW, height:(H-mB)-yb, fill:'var(--accent)', rx:1});
+    const r3 = el('rect',{x:x0+gap+(barW+2)*2, y:yc, width:barW, height:(H-mB)-yc, fill:'var(--accent2)', rx:1});
+    svg.appendChild(r1); svg.appendChild(r2); svg.appendChild(r3);
+    if (i%2===0) {
+      const xt = el('text',{x:x0+groupW/2, y:H-mB+16,'text-anchor':'middle','font-size':9,fill:'var(--ink-muted)','font-family':'monospace'});
+      xt.textContent = bk; svg.appendChild(xt);
+    }
+  });
+  svg.appendChild(el('line',{x1:mL,x2:mL,y1:mT,y2:H-mB,stroke:'var(--ink-faint)'}));
+  svg.appendChild(el('line',{x1:mL,x2:W-mR,y1:H-mB,y2:H-mB,stroke:'var(--ink-faint)'}));
+}
+drawRawVsTargetable('rawVsTargetableChart32', chartData.any_n_components_32, chartData.any_n_targetable_32, chartData.hem_n_targetable_32);
+drawRawVsTargetable('rawVsTargetableChart16', chartData.any_n_components, chartData.any_n_targetable, chartData.hem_n_targetable);
+
+// ---- cumulative components (left axis) vs targetable any (right axis), ascending by size ----
+(function() {
+  const svg = document.getElementById('cumChart');
+  const W = 1100, H = 380, mL = 78, mR = 78, mT = 14, mB = 40;
+  const plotW = W - mL - mR, plotH = H - mT - mB;
+  const buckets = chartData.buckets;
+  const n = buckets.length;
+  const N_TICKS = 6; // shared gridline count -- each axis gets its own nice max, same number of intervals
+  const leftMax = 3.0e9;   // raw components: 0..3.0B in 500M steps
+  const rightMax = 150e6;  // targetable (any): 0..150M in 25M steps
+  function xFor(i) { return mL + plotW * i/(n-1); }
+  function yForFrac(frac) { return mT + plotH * (1 - frac); }
+  function yForLeft(v) { return yForFrac(v/leftMax); }
+  function yForRight(v) { return yForFrac(v/rightMax); }
+  function fmtCount(v) {
+    if (v === 0) return '0';
+    return v>=1e9 ? (v/1e9).toFixed(1)+'B' : v>=1e6 ? (v/1e6).toFixed(0)+'M' : (v/1e3).toFixed(0)+'K';
+  }
+
+  for (let k=0; k<=N_TICKS; k++) {
+    const frac = k/N_TICKS;
+    const y = yForFrac(frac);
+    svg.appendChild(el('line',{x1:mL,x2:W-mR,y1:y,y2:y,stroke:'var(--grid)','stroke-width':1}));
+    const tl = el('text',{x:mL-8,y:y+3,'text-anchor':'end','font-size':10,fill:'var(--ink-faint)','font-family':'monospace'});
+    tl.textContent = fmtCount(frac*leftMax); svg.appendChild(tl);
+    const tr = el('text',{x:W-mR+8,y:y+3,'text-anchor':'start','font-size':10,fill:'var(--ink-muted)','font-family':'monospace'});
+    tr.textContent = fmtCount(frac*rightMax); svg.appendChild(tr);
+  }
+  const xTickIdx = [0,4,8,12,16,19,20,22,24,26];
+  xTickIdx.forEach(i => {
+    const x = xFor(i);
+    svg.appendChild(el('line',{x1:x,x2:x,y1:mT,y2:H-mB,stroke:'var(--grid)','stroke-width':1}));
+    const t = el('text',{x:x,y:H-mB+16,'text-anchor':'middle','font-size':9,fill:'var(--ink-faint)','font-family':'monospace'});
+    t.textContent = buckets[i]; svg.appendChild(t);
+  });
+
+  // solid = 32/10, dashed = 16/6 -- same convention as the pct chart and the Threshold Comparison Report
+  [
+    ["cum_components_32","cum_components","var(--ink-faint)",yForLeft],
+    ["cum_targetable_any_32","cum_targetable_any","var(--accent)",yForRight],
+    ["cum_targetable_hem_32","cum_targetable_hem","var(--accent2)",yForRight],
+  ].forEach(([key32,key16,color,yf]) => {
+    [[key32,'0',2.4,true],[key16,'5,4',1.6,false]].forEach(([key,dash,width,markers]) => {
+      const vals = chartData[key];
+      let d = '';
+      vals.forEach((v,i) => {
+        const x = xFor(i), y = yf(v);
+        d += (d===''?'M':'L') + x.toFixed(1) + ',' + y.toFixed(1) + ' ';
+      });
+      svg.appendChild(el('path',{d:d, fill:'none', stroke:color, 'stroke-width':width,'stroke-dasharray':dash, opacity:0.95}));
+      if (markers) vals.forEach((v,i) => {
+        svg.appendChild(el('circle',{cx:xFor(i), cy:yf(v), r:2.8, fill:color}));
+      });
+    });
+  });
+
+  svg.appendChild(el('line',{x1:mL,x2:mL,y1:mT,y2:H-mB,stroke:'var(--ink-faint)'}));
+  svg.appendChild(el('line',{x1:W-mR,x2:W-mR,y1:mT,y2:H-mB,stroke:'var(--ink-faint)'}));
+  svg.appendChild(el('line',{x1:mL,x2:W-mR,y1:H-mB,y2:H-mB,stroke:'var(--ink-faint)'}));
+
+  const midY = mT + plotH/2;
+  const leftTitle = el('text',{x:18,y:midY,'text-anchor':'middle','font-size':11,fill:'var(--ink-muted)','font-family':'monospace',transform:`rotate(-90 18 ${midY})`});
+  leftTitle.textContent = 'raw (all components)'; svg.appendChild(leftTitle);
+  const rightTitle = el('text',{x:W-16,y:midY,'text-anchor':'middle','font-size':11,fill:'var(--ink-muted)','font-family':'monospace',transform:`rotate(90 ${W-16} ${midY})`});
+  rightTitle.textContent = 'targetable (any / hem)'; svg.appendChild(rightTitle);
+})();
+
+// ---- pct targetable by size bucket (line chart, 3 series) ----
+(function() {
+  const svg = document.getElementById('pctChart');
+  const W = 1100, H = 420, mL = 50, mR = 16, mT = 14, mB = 40;
+  const plotW = W - mL - mR, plotH = H - mT - mB;
+  const buckets = chartData.buckets;
+  const n = buckets.length;
+  function xFor(i) { return mL + plotW * i/(n-1); }
+  function yFor(v) { return mT + plotH * (1 - v/100); }
+
+  for (let p=0; p<=100; p+=20) {
+    const y = yFor(p);
+    svg.appendChild(el('line',{x1:mL,x2:W-mR,y1:y,y2:y,stroke:'var(--grid)','stroke-width':1}));
+    const t = el('text',{x:mL-8,y:y+3,'text-anchor':'end','font-size':10,fill:'var(--ink-faint)','font-family':'monospace'});
+    t.textContent = p+'%'; svg.appendChild(t);
+  }
+  const xTickIdx = [0,4,8,12,16,19,20,22,24,26];
+  xTickIdx.forEach(i => {
+    const x = xFor(i);
+    svg.appendChild(el('line',{x1:x,x2:x,y1:mT,y2:H-mB,stroke:'var(--grid)','stroke-width':1}));
+    const t = el('text',{x:x,y:H-mB+16,'text-anchor':'middle','font-size':9,fill:'var(--ink-faint)','font-family':'monospace'});
+    t.textContent = buckets[i]; svg.appendChild(t);
+  });
+
+  const series = [
+    {key:'any_pct', key32:'any_pct_32', color:'var(--accent)', label:'any'},
+    {key:'hem_pct', key32:'hem_pct_32', color:'var(--accent2)', label:'hem'},
+    {key:'maid_pct', key32:'maid_pct_32', color:'var(--good)', label:'maid'},
+  ];
+  series.forEach(s => {
+    [[s.key32,'0',2.4,true],[s.key,'5,4',1.8,false]].forEach(([dataKey,dash,width,markers]) => {
+      const vals = chartData[dataKey];
+      let d = '';
+      vals.forEach((v,i) => {
+        const x = xFor(i), y = yFor(v);
+        d += (d===''?'M':'L') + x.toFixed(1) + ',' + y.toFixed(1) + ' ';
+      });
+      svg.appendChild(el('path',{d:d, fill:'none', stroke:s.color, 'stroke-width':width,'stroke-dasharray':dash, opacity:0.95}));
+      if (markers) vals.forEach((v,i) => {
+        svg.appendChild(el('circle',{cx:xFor(i), cy:yFor(v), r:2.6, fill:s.color}));
+      });
+    });
+  });
+
+  svg.appendChild(el('line',{x1:mL,x2:mL,y1:mT,y2:H-mB,stroke:'var(--ink-faint)'}));
+  svg.appendChild(el('line',{x1:mL,x2:W-mR,y1:H-mB,y2:H-mB,stroke:'var(--ink-faint)'}));
+
+  const legend = document.getElementById('pctLegend');
+  series.forEach(s => {
+    const item = document.createElement('div');
+    item.className = 'legend-item';
+    const sw = document.createElement('span');
+    sw.className = 'legend-swatch';
+    sw.style.background = s.color;
+    item.appendChild(sw);
+    item.append(s.label + ' (solid=32/10, dashed=16/6)');
+    legend.appendChild(item);
+  });
+})();
+
+// ---- full tables, one per config ----
+function fillFullTable(tbodyId, nComp, nAny, pAny, nHem, pHem, nMaid, pMaid) {
+  const tbody = document.getElementById(tbodyId);
+  const buckets = chartData.buckets;
+  const highlightSet = new Set(['1','21-32','65-128','giant (>1024)']);
+  buckets.forEach((bk,i) => {
+    const tr = document.createElement('tr');
+    if (highlightSet.has(bk)) tr.className = 'highlight';
+    const cells = [
+      bk, fmt(nComp[i]),
+      fmt(nAny[i]), pAny[i].toFixed(2)+'%',
+      fmt(nHem[i]), pHem[i].toFixed(2)+'%',
+      fmt(nMaid[i]), pMaid[i].toFixed(2)+'%',
+    ];
+    cells.forEach(c => {
+      const td = document.createElement('td');
+      td.textContent = c;
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+  });
+}
+fillFullTable('fullTableBody32',
+  chartData.any_n_components_32, chartData.any_n_targetable_32, chartData.any_pct_32,
+  chartData.hem_n_targetable_32, chartData.hem_pct_32, chartData.maid_n_targetable_32, chartData.maid_pct_32);
+fillFullTable('fullTableBody16',
+  chartData.any_n_components, chartData.any_n_targetable, chartData.any_pct,
+  chartData.hem_n_targetable, chartData.hem_pct, chartData.maid_n_targetable, chartData.maid_pct);
+</script>

@@ -230,6 +230,13 @@ Finding 6. Supporting detail:
 
 ## 7. What each file owns
 
+**Location (2026-10-30)**: all Databricks code moved out of the repo root into
+`python-databricks/`. ID-graph notebooks are in `python-databricks/IDGraph/`
+(`IDGraph_Build_`, `IDGraph_CC_`, `IDGraph_CC_Analysis_`, `IDGraph2_CC_`,
+`IDGraph_Fanout_Sweep_`, `IDGraph_Edge_Labels_Databricks.py`); the shared
+`staging_df.py` utility is at `python-databricks/staging_df.py`. The journal
+and data outputs (`idgraph*.csv`/`.html`) stay at the repo root.
+
 | File | Owns |
 |---|---|
 | `IDGraph_EDA.ipynb` | Earliest exploratory pass (pandas) over the raw joined ID data, before DuckDB was adopted. |
@@ -394,3 +401,257 @@ palette can cleanly separate on color alone.
 `idgraph3_top5_components_by_type.csv`) plus the per-type summary numbers in
 §6b of this journal are sufficient to regenerate every number in the report
 without needing the original Databricks pastes again.
+
+## 10. Affinity crosswalk matching (32/10 + 16/6, DCR refresh 20261008)
+
+Code lives in `IDGraph_CC_Analysis_Databricks.py`, "Affinity crosswalk
+matching" section. One deliverable table, `affinity_enhanced_components`
+(`{CC_OUTPUT_PATH}/affinity_enhanced_components`): exact replica of `result`
+(all 6 types, same row count) plus `afs_individual_ids` (`array<string>` --
+a node can map to more than one AFS id, gathered via `collect_set` rather
+than silently fanning out the join) and `has_afs_id` (bool). Only
+`HEM_MD5`/`HARDWARE_ANDROID_AD_ID`/`HARDWARE_IDFA` are joined against the
+crosswalk (`all_id_to_afs_id`) -- it has no entries for `ID5_UID`/`TTD`/`ST`,
+so those always come out with an empty array, never joined.
+
+**Node-level match rates, first real run**:
+
+| type | n_nodes | n_with_afs_id | pct |
+|---|---:|---:|---:|
+| HEM_MD5 | 453,949,154 | 89,884,356 | 19.80% |
+| HARDWARE_IDFA | 727,086,362 | 48,713,684 | 6.70% |
+| HARDWARE_ANDROID_AD_ID | 758,637,201 | 46,698,298 | 6.16% |
+| TTD / ID5_UID / ST | (their totals) | 0 | 0% |
+
+**Component-level targetability by size bucket**: three tables,
+`component_targetability_{any,hem,maid}` (`any` = targetable via any
+eligible type; `hem` = via `HEM_MD5`; `maid` = via `HARDWARE_ANDROID_AD_ID`
+or `HARDWARE_IDFA`), saved as `idgraph3_component_targetability_{any,hem,
+maid}.csv` in this directory (each sums to exactly 2,728,350,341 --
+the known 16/6 total component count, cross-checked). Headline: **targetability
+rises steadily with component size** -- 3.99% of singletons (`any`) vs.
+>90% by the 65-128 bucket, up to 100% for the giant component. Internal
+consistency holds exactly where it must: at size 1, `any = hem + maid`
+precisely (a singleton can't be targetable via both at once); at every
+larger bucket `any <= hem + maid`, with the gap being components targetable
+via both simultaneously.
+
+**The size-16 `id5` anomaly shows up a 4th time, in this new metric**:
+`pct_targetable` (all three of any/hem/maid) breaks its otherwise smooth
+rise exactly at size 16 (e.g. `any`: 36.42% at 15 -> **34.68%** at 16 ->
+40.43% at 17), then recovers. This can't be a `MAX_FANOUT=16`-boundary
+artifact specifically -- the same anomaly already showed up at size 16 in
+the 32/10 run (`MAX_FANOUT=32`), so its location at 16 doesn't depend on
+what `MAX_FANOUT` actually is. **However, the obvious mechanism (more
+`ID5_UID` at size 16 crowding out the 3 eligible types) does not cleanly
+explain the shape**: the eligible-type share (AAID+IDFA+HEM_MD5) declines
+*monotonically* across 15->16->17 (39.84% -> 36.10% -> 33.90% per the
+existing type-mix table), while targetability dips at 16 and *recovers* at
+17 -- a monotonic composition shift can't produce a dip-then-recovery. Open:
+whether size-16 components specifically have a higher rate of zero eligible-
+type nodes at all (a distributional effect, not just an average-share
+effect) would need a direct query against `component_affinity_flags`
+to confirm -- not yet run.
+
+**Also noted, smaller sample**: `pct_targetable` dips slightly at 513-1024
+relative to 257-512/129-256 in all three tables (`any`: 99.22% -> 96.94%,
+only ~3 of 98 components) -- plausibly connected to the known extreme-TTD
+outlier components in that exact bucket (`idgraph3_top5_components_by_type.csv`
+-- the size-865/617 components that are 77.7%/100% TTD, a type with zero
+affinity coverage), but the sample is too small (98 components) to
+distinguish from noise.
+
+**Done**: the before/after component-size comparison is built --
+https://claude.ai/code/artifact/2d73e95c-7e05-4e7e-b764-d3b87bd462f0
+("How much of the graph is actually targetable?"), canonical source saved as
+`idgraph3_affinity_targetability_report.html` in this directory. Headline:
+only **4.80%** of all 2,728,350,341 components are targetable at all (`any`
+definition); targetability rises from 3.99% at singletons to 100% for the
+giant, but singletons are 88.6% of all components so they dominate the
+absolute volume -- 2,321,821,874 of the 2,597,331,361 untargetable
+components (89.4%) are singletons. Raw per-bucket numbers for all three
+definitions (any/hem/maid) are in
+`idgraph3_component_targetability_{any,hem,maid}.csv`. `hem` vs `maid`
+trade the lead twice across the size range (maid leads at singletons, hem
+leads at sizes 2-11, maid leads again from 12 through 257-512, hem edges
+back ahead at the small-sample 513-1024 bucket) -- see the artifact for the
+full per-bucket table.
+
+**32/10 run added, 2026-10-25 -- the artifact above now compares both
+configs.** Raw tables saved as
+`idgraph3_component_targetability_{any,hem,maid}_32_10.csv` (each verified
+to sum to exactly 1,478,773,504, the known 32/10 total component count).
+Headline: **16/6 is more targetable than 32/10 at every single size
+bucket**, not just in aggregate (4.80% vs 4.04% overall `any`; singletons
+3.99% vs 2.96%) -- tightening the threshold config doesn't just reshape the
+graph (the Threshold Comparison Report's subject), it directly improves how
+much of it is reachable for affinity targeting.
+
+**The 513-1024 TTD-outlier connection is now confirmed, not just
+plausible.** At 32/10, the 513-1024 bucket is **0.00% targetable** under
+all three definitions (0 of 6 components) and 257-512 craters to 13.33%
+(`any`) -- vs. 96.94%/99.22% at 16/6. This is exactly the size range (and
+exactly the config) where `idgraph3_top5_components_by_type.csv` already
+identified specific near-giant components that are 100% TTD (size 617) or
+TTD+ID5_UID only (size 782, no eligible-type nodes at all) -- structurally
+incapable of matching the crosswalk regardless of match rate, since
+`TTD`/`ID5_UID` have zero affinity coverage. It's also the same 257-512/
+513-1024 range §3 Finding 7 already flagged as a TTD-dominance pathology at
+32/10 that's "completely gone" at 16/6 -- three independent analyses
+(type-mix pathology, top-5-components type breakdown, and now targetability)
+now point at the same mechanism from three different angles.
+
+**The size-16 `id5` anomaly holds the same shape under 32/10 too**
+(`any`: 32.30% at 15 -> 29.06% at 16 -> 35.98% at 17), reinforcing it's a
+property of the underlying `id5` data, not specific to either threshold
+config -- consistent with everywhere else this anomaly has shown up.
+
+## 11. MAX_FANOUT singleton sweep (2026-10-27)
+
+`IDGraph_Fanout_Sweep_Databricks.py` predicts the singleton count for every
+MAX_FANOUT at once, with no CC run: a node is non-singleton at fanout F iff
+its smallest grouping-key group with `n_distinct >= 2` (across id5/tapad/liid)
+is <= F. STAR_THRESHOLD is irrelevant (star and clique both connect every
+member). Inputs: `{via}_filtered_base` + `{via}_fanout` from
+`IDGraph5/build_output` (identical to IDGraph4's), `node_types` from
+`IDGraph3/build_output`. First run hit Spark's "shuffle map stage with
+indeterminate output" abort even at `shuffle.partitions=10000`; fixed by
+staging each via_type's join separately before the final groupBy.
+
+**Validated exactly**: predicted F=32 -> 1,228,969,090 and F=16 ->
+2,418,307,483 singletons, matching both CC runs to the node. Raw output saved
+as `idgraph_fanout_sweep_by_type.csv` (20 F values, per-type %) and
+`idgraph_fanout_sweep_full.csv` (every F 2..1024 + uncapped).
+
+**Findings:**
+- **Singletons are almost entirely a MAX_FANOUT artifact.** Only 70,987,514
+  nodes (1.44%) are unlinkable at any fanout. Of the singletons, 94% at 32
+  and 97% at 16 are fanout-stranded.
+- **Natural group sizes are large.** 94% of nodes are singletons even at
+  F=2, and the median node's smallest group is ~16 (singleton rate crosses
+  50% between F=15 and 16). Half of all nodes belong only to groups of 16+.
+- **No knee below ~64.** The curve falls smoothly (25.0% at 32, 7.6% at 64,
+  3.3% at 96, 2.1% at 128, 1.5% at 256); there's no singleton-based natural
+  cutoff, so F has to be chosen against the giant-component side.
+- **Per type**: ID5_UID links most easily (85.9% singleton at F=2 vs
+  95-99% for others) but has the highest baseline (3.50%, ~55M of the 71M).
+  HARDWARE_IDFA sits in the biggest groups (99.4% at F=2, 38.3% at 32).
+  ST's baseline is ~0.01%.
+- **Known histogram anomalies reappear as spikes in newly-linked nodes per
+  F** (increment vs. mean of neighbors): F=16 (+4.9%, the id5 n=16 anomaly,
+  5th independent appearance), F=32 (+6.6%, id5's natural ceiling), F=38
+  (+2.9%, liid zone), and F=53 (+20%, followed by a sustained higher level
+  through ~60 -- a step, i.e. a distinct population of groups starting at
+  size 53; matches the liid 52-55 zone).
+
+**Crosswalk HEM size (2026-10-29)**, `all_id_to_afs_id` refresh 20261008,
+`Type=hem, Subtype=md5`: 1,734,351,089 rows, **211,954,481 distinct HEMs**,
+88,228,090 distinct AFS individuals. So the overlap is 89,884,356 HEMs =
+19.80% of ours (453.9M) and **42.4% of Affinity's**. ~8.2 rows per HEM
+(heavy row duplication -- always countDistinct on this table); ~2.40 HEMs
+per AFS individual on average.
+
+**Crosswalk schema** (`all_id_to_afs_id`): `INDID, AFS_INDID, AFS_HHID,
+AFS_INDIVIDUAL_ID, ID, Vendor, Type, Subtype`. Sample row: `INDID == ID`
+(the HEM itself), `Vendor = liveintent`. `Vendor` is the provenance column
+needed to test liid self-agreement; `AFS_HHID` is a household id, which
+allows separating "same household, different person" from unrelated merges.
+Meaning of `AFS_INDID` vs `AFS_INDIVIDUAL_ID` (we use the latter) not yet
+confirmed.
+
+## 12. Learning edge quality from Affinity labels (plan + Steps 0-1, 2026-10-30)
+
+**Ground rule (user decision)**: the Affinity crosswalk is out-of-sample data.
+It may be used to learn settings and to evaluate graphs, **never** to add
+edges, merge nodes, or otherwise build the graph.
+
+**Goal**: learn which of our links are trustworthy -- by source (via_type),
+type pair, group size, and chaining -- turn that into build settings, and
+prove a new graph is better on held-out labels.
+
+### What is being tested
+Every grouping key (one id5/tapad/liid value) claims all its members are one
+person. For every pair of Affinity-matched nodes (HEM_MD5 / IDFA / AAID)
+sharing a key, check whether Affinity agrees:
+
+| Affinity says | label |
+|---|---|
+| same AFS individual (their `AFS_INDIVIDUAL_ID` sets overlap) | `agree` |
+| different, both nodes' AFS individuals have >= 2 crosswalk IDs ("multi") | `strong_disagree` |
+| different, at least one side's AFS individual has 1 crosswalk ID ("single") | `weak_disagree` |
+
+Rationale for weak: a single-ID AFS individual may be one Affinity never
+linked to anything, so its "different person" may mean "don't know". This is
+an assumption -- tested by reporting `agree_rate_strong` (agree / (agree +
+strong)) next to `agree_rate_all` (agree / all labeled).
+
+TTD/ID5_UID/ST are never labeled directly (no crosswalk coverage). Key-level
+quality learned on labeled members is assumed to carry over to a key's
+unlabeled members; Step 2 tests TTD/ID5 as bridges directly.
+
+### Data: nothing was lost to the star layout
+`{via}_filtered_base` + `{via}_fanout` hold full key membership for every
+key, including groups above MAX_FANOUT -- the star only changed which pairs
+became edges. `edges` is useless here (via_type collapsed into a count).
+`{via}_pairs`/`via_keys` are limited by star + cap. So all pairs are rebuilt
+from filtered_base, independent of MAX_FANOUT/STAR_THRESHOLD: one run serves
+every config.
+
+### Steps
+- **Step 0 (built)** -- node labels (`afs_ids`, `afs_class` single/multi,
+  `split`); split by `xxhash64(SPLIT_SALT, AFS_INDIVIDUAL_ID) % 100 <
+  TUNE_PCT` (70/30), so one person never lands in both; a node with several
+  AFS ids takes its smallest one's split; pairs only within one split.
+  Coverage check: AFS individuals by number of OUR nodes (only those with
+  >= 2 produce `agree` pairs). Sanity: matched HEM 89,884,356 / IDFA
+  48,713,684 / AAID 46,698,298.
+- **Step 1 (built)** -- labeled pairs per via_type within keys of size
+  2..1024 (`MAX_PAIR_GROUP_SIZE`); collapsed to one row per (via_type, pair)
+  at its smallest group size; corroboration = which via_types link the pair
+  (`via_set`, e.g. `liid+tapad`). Summaries **on the tune split only**: by
+  via_type; via_type x type pair; via_type x type pair x group size; via_set
+  x type pair.
+- **Step 2 (not built)** -- chained pairs: matched pairs sharing no key but
+  joined through one middle node (e.g. HEM -liid- TTD -tapad- IDFA), by
+  source of each step, middle node type, group sizes; moderate sizes only.
+  This is the giant-component mechanism and the direct TTD-bridge test.
+- **Step 3 (not built)** -- score any built graph on the **holdout** split:
+  recall (% same-person pairs in one component) and false-merge rate (% strong
+  different-person pairs in one component), alongside singletons (fanout
+  sweep) and targetability. Replaces the component-validation section briefly
+  added to the analysis notebook on 2026-10-29 (removed).
+
+### What the results feed (tuning levers)
+1. Per-via_type caps instead of one MAX_FANOUT (largest size where agreement
+   stays above a target; singleton cost from §11 sweep).
+2. Type-pair rules (e.g. HEM-IDFA from tapad trusted to larger sizes than
+   HEM-HEM); also star hub choice.
+3. Edge weights = estimated agreement for (via_type, type pair, size,
+   corroboration); then threshold edges before CC, or weighted community
+   detection (Leiden) inside the giant.
+4. Chain limits from Step 2 (e.g. no merges bridged through TTD) -- the
+   long-pending TTD-specific fix.
+5. Every candidate graph checked with Step 3 on holdout before adoption.
+
+### Deferred
+- Household (`AFS_HHID`): 3-way agree / same household / different household.
+- liid self-agreement: Affinity's HEM links may come from LiveIntent
+  (crosswalk `Vendor` column, e.g. `liveintent`), inflating liid. Check by
+  re-scoring liid against non-liveintent crosswalk rows only. Main analysis
+  doesn't need `Vendor`: our via_type comes from filtered_base.
+- `AFS_INDID` vs `AFS_INDIVIDUAL_ID` meaning unconfirmed; we use the latter.
+
+### Notebook: `IDGraph_Edge_Labels_Databricks.py`
+Reads `{GRAPH_ROOT}/build_output/{via}_filtered_base|_fanout` (GRAPH_ROOT =
+IDGraph5 by default; IDGraph4 identical), `IDGraph3/build_output/node_types`,
+crosswalk refresh 20261008. Writes everything under
+`{GRAPH_ROOT}/edge_labels/`: `cw_nodes`, `node_labels`, `node_label_summary`,
+`afs_graph_coverage`, `labeled_members_{via}`, `labeled_pairs_{via}`,
+`pairs_by_via`, `pair_corroboration`, `agreement_by_via_type_pair_size`,
+`agreement_by_corroboration`. Every join is inside `@stage_dataframe`, each
+via_type staged separately (lesson from the §11 indeterminate-stage abort),
+so a crash resumes from the last finished stage. Standard Spark config block
+at the top (shuffle.partitions 20000, AQE + coalesce + skew join, Delta
+optimizeWrite). Verified end-to-end on toy data with local Spark
+(2026-10-30); not yet run on Databricks.
+**Never change `SPLIT_SALT`/`TUNE_PCT` after first results are seen.**
