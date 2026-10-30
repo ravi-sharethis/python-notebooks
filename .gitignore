@@ -10,6 +10,9 @@ venv/
 .DS_Store
 .idea/
 .vscode/
+*.swp
+*.swo
+*~
 
 # Local data -- data lives in ~/code/data and S3, not in this repo
 *.parquet
