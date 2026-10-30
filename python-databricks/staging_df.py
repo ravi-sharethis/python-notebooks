@@ -1,4 +1,8 @@
 def _path_exists(path):
+    # Imported as a module, so the notebook's global `dbutils` isn't visible here.
+    from pyspark.dbutils import DBUtils
+
+    dbutils = DBUtils(SparkSession.getActiveSession())
     try:
         dbutils.fs.ls(path)
         print (f"{path} exists")
