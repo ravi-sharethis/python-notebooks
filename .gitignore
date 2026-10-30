@@ -1,2 +1,15 @@
+# Python / Jupyter
 __pycache__/
+*.pyc
 .ipynb_checkpoints/
+.venv/
+venv/
+.env
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+
+# Local data -- data lives in ~/code/data and S3, not in this repo
+*.parquet

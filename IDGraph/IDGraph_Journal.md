@@ -230,12 +230,14 @@ Finding 6. Supporting detail:
 
 ## 7. What each file owns
 
-**Location (2026-10-30)**: all Databricks code moved out of the repo root into
-`python-databricks/`. ID-graph notebooks are in `python-databricks/IDGraph/`
-(`IDGraph_Build_`, `IDGraph_CC_`, `IDGraph_CC_Analysis_`, `IDGraph2_CC_`,
-`IDGraph_Fanout_Sweep_`, `IDGraph_Edge_Labels_Databricks.py`); the shared
-`staging_df.py` utility is at `python-databricks/staging_df.py`. The journal
-and data outputs (`idgraph*.csv`/`.html`) stay at the repo root.
+**Location (2026-10-30)**: repo reorganized by project. ID graph: this
+journal, local notebooks (`IDGraph_EDA`, `IDGraph_ConnectedComponents` +
+`connected_components.py`) in `IDGraph/`; saved CSV outputs in
+`IDGraph/results/`; HTML reports in `IDGraph/reports/`. Databricks notebooks
+in `python-databricks/IDGraph/`, shared `staging_df.py` in
+`python-databricks/`. TTD pricing work in `TTD/`, other notebooks in `misc/`.
+Older entries below that say a file is "in python-notebooks/" or "in this
+directory" refer to these locations now.
 
 | File | Owns |
 |---|---|
