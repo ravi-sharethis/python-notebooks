@@ -193,9 +193,12 @@ RESULT_PATH = f"{CC_OUTPUT_PATH}/result"
 # every downstream targetability number without a corresponding code change to point
 # at in git history.
 AFFINITY_RDATE = "20261008"
-AFFINITY_CROSSWALK_PATH = (
-    f"s3://data-science-research/affinity_matching/DCR/refresh/{AFFINITY_RDATE}/crosswalk/all_id_to_afs_id"
-)
+# Working copy of the 20261008 crosswalk -- use this for now.
+AFFINITY_CROSSWALK_PATH = f"s3://data-science-research/ravi/afs_crosswalk_{AFFINITY_RDATE}"
+# Prod / original location -- switch back to this when moving to prod:
+# AFFINITY_CROSSWALK_PATH = (
+#     f"s3://data-science-research/affinity_matching/DCR/refresh/{AFFINITY_RDATE}/crosswalk/all_id_to_afs_id"
+# )
 
 # COMMAND ----------
 

@@ -657,3 +657,12 @@ at the top (shuffle.partitions 20000, AQE + coalesce + skew join, Delta
 optimizeWrite). Verified end-to-end on toy data with local Spark
 (2026-10-30); not yet run on Databricks.
 **Never change `SPLIT_SALT`/`TUNE_PCT` after first results are seen.**
+
+**Crosswalk working copy (2026-10-30)**: both notebooks that read the
+crosswalk (`IDGraph_CC_Analysis_Databricks.py`, `IDGraph_Edge_Labels_Databricks.py`)
+now read the user's copy `s3://data-science-research/ravi/afs_crosswalk_20261008`.
+The prod/original path
+(`s3://data-science-research/affinity_matching/DCR/refresh/{AFFINITY_RDATE}/crosswalk/all_id_to_afs_id`)
+is kept commented directly below in each, to switch back for prod. Results
+recorded above (§10 match rates, targetability) were produced from the
+original path.
