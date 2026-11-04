@@ -730,7 +730,25 @@ HEM-IDFA 70.3), vs liid-only 1-12% and tapad-only 18-61%. Volume is small
 ## 14. Component quality vs Affinity: design for notebooks A + B (agreed 2026-11-04)
 
 Simpler, component-level follow-up to §12-13 (pairs explain *why*; this
-scores *outcomes*). Not built yet. Every join staged; standard config block;
+scores *outcomes*). **Notebook A built 2026-11-04** (`python-databricks/IDGraph/IDGraph_Component_Quality_Databricks.py`),
+verified on a toy graph with local Spark, not yet run on Databricks.
+Inputs: `IDGraph5/build_output/{via}_filtered_base|_fanout` (cap-independent;
+identical in IDGraph4), `{GRAPH_ROOT}/cc_output/result`,
+`IDGraph5/edge_labels/node_labels`. Config `MAX_FANOUT` is a per-source dict
+matching the scored build. Outputs by dependency:
+- `s3://data-science-research/ravi/IDGraph_common/component_quality/` --
+  `node_via_groups_{via}` (per node: sorted non-denylisted group sizes + deny
+  flag). Depends only on filtered_base + DENYLIST: reused by every graph.
+- `{GRAPH_ROOT}/component_quality/graph/` -- `node_sources` (caps applied:
+  source_set, raw_source_set, singleton_reasons, dropped sizes), `nodes`,
+  `component_structure`, `component_tokens`, `singletons`. Shared by tune/holdout.
+- `{GRAPH_ROOT}/component_quality/{SCORE_SPLIT}/` -- `matched_nodes`,
+  `component_afs`, `person_spread`, `component_matches`, `component_summary`,
+  `breakdown_*`, `person_split_summary`.
+No pairs tables are read: "linked by source v" = has a non-denylisted key of
+size 2..cap, which is how the build makes pairs; two consistency checks
+(expected 0) catch a cap/denylist mismatch.
+Notebook B not built. Every join staged; standard config block;
 Affinity used only to label/evaluate, never to split or merge a specific
 component (§ Affinity = labels only).
 
