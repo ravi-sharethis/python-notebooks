@@ -38,7 +38,10 @@ def check_if_dataframe_exists(
         raise ValueError("Expected 'delta' or 'parquet'")
 
     try:
-        _ = spark_read_parquet_or_delta(path, spark)
+        df = spark_read_parquet_or_delta(path, spark)
+        # Spark Connect (serverless / shared clusters) reads lazily: a missing path
+        # only fails once the plan is analyzed. Touch the schema so it fails here.
+        _ = df.schema
         return True
     except Exception:
         return False
