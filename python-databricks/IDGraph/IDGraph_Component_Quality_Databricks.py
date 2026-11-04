@@ -77,7 +77,11 @@ SOURCE_BUILD_PATH = "s3://data-science-research/ravi/IDGraph5/build_output"
 NODE_LABELS_PATH = "s3://data-science-research/ravi/IDGraph5/edge_labels/node_labels"
 
 # "tune" for analysis / model training, "holdout" for final scoring only.
-SCORE_SPLIT = "tune"
+# Widget so a job can run this notebook twice: a task with no parameter gets
+# "tune"; the second task passes SCORE_SPLIT=holdout and must depend on the
+# first -- both write the shared graph/ folder, so never run them at once.
+dbutils.widgets.dropdown("SCORE_SPLIT", "tune", ["tune", "holdout"])
+SCORE_SPLIT = dbutils.widgets.get("SCORE_SPLIT")
 
 # Reused across graphs built from the same filtered_base + DENYLIST. If either
 # changes, point this at a new folder.
