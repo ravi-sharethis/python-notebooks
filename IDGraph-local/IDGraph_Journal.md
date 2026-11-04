@@ -748,7 +748,27 @@ matching the scored build. Outputs by dependency:
 No pairs tables are read: "linked by source v" = has a non-denylisted key of
 size 2..cap, which is how the build makes pairs; two consistency checks
 (expected 0) catch a cap/denylist mismatch.
-Notebook B not built. Every join staged; standard config block;
+**Notebook B built 2026-11-04** (`python-databricks/IDGraph/IDGraph_Component_Quality_Models_Databricks.py`),
+verified end-to-end on a synthetic graph (4k components + 4k singletons, planted
+signals recovered: liid tokens ~35% over-merged vs tapad ~16%; tapad-dropped
+singletons ~40% incomplete vs alone ~10%); not yet run on Databricks. Needs A run
+on BOTH splits. Outputs under `{GRAPH_ROOT}/component_quality/models/`: features,
+labels_{split}_{target}, all_tokens, lookup_rates_*, nb_token_counts_*,
+nb_token_rates_*, nb_scores_*, model_inputs_*, train_rows_*, fitted_{model}_{target}
+(saved Spark ML pipelines), scores_{target} (p_lookup, p_lr, p_nb_sum, p_nb_mean
+for every component), eval_hist_{target}. Models: lookup (4 fallback levels,
+LOOKUP_MIN_CELL=100), nb_sum / nb_mean (token log-odds sum / node-weighted mean,
+each calibrated by a 2-input LR with log2 size), lr (size, source shares, ID-type
+shares, group sizes, singleton reasons; trained on LR_TRAIN_FRACTION=0.1 sample).
+Evaluation: holdout AUC overall + within size strata, calibration by 10% band.
+Singleton tokens: `singleton[<reasons>]:<type>` + `dropped_size=<bucket>:DROPPED_SIZE`.
+
+**Caveat found in testing -- over-merge depends on split size**: class 2 needs two
+different people from the same split, so holdout (30% of people) sees fewer
+over-merges than tune (70%): synthetic 21% vs 9% of judgeable components. AUC is
+comparable across splits; over-merge probabilities/calibration are not (read as
+"visible with 70% of people"). Incomplete is unaffected (a person's IDs are all in
+one split). Compare graphs only on the same split. Every join staged; standard config block;
 Affinity used only to label/evaluate, never to split or merge a specific
 component (§ Affinity = labels only).
 
