@@ -666,3 +666,150 @@ The prod/original path
 is kept commented directly below in each, to switch back for prod. Results
 recorded above (§10 match rates, targetability) were produced from the
 original path.
+
+## 13. Edge-label results, Step 1, tune split (2026-10-30)
+
+First Databricks run of `IDGraph_Edge_Labels_Databricks.py` (IDGraph5
+build_output; group size = smallest shared key's n_distinct). Raw tables:
+`results/idgraph_edge_labels_by_via_type_pair_size_tune.csv`,
+`results/idgraph_edge_labels_corroboration_tune.csv` (per-via and
+per-type-pair totals are sums of the size table; they match the printout).
+"agree %" below = agree / (agree + strong_disagree). It is a lower bound on
+precision (Affinity misses links too); compare cells relative to each other.
+
+**No id5 rows at all.** id5 produced no labeled pairs. Not yet explained:
+check `labeled_members_id5` / `labeled_pairs_id5` counts.
+
+| via | pairs | agree % |
+|---|---|---|
+| liid | 893M | 2.2 |
+| tapad | 84M | 42.1 |
+
+**liid is good at small sizes and noise at large ones.** 97% of liid pairs
+come from keys of size 49-128, where agreement is <1-7%. At size <=16:
+HEM-IDFA ~62%, AAID-HEM ~53%, AAID-AAID 37-57%, IDFA-IDFA 33-38%,
+AAID-IDFA ~23%. Steep drop from 17 onwards (HEM-IDFA 52 -> 39 -> 22 -> 7%
+across 17-24 / 25-32 / 33-48 / 49-64). liid never produces HEM-HEM pairs
+(one HEM per liid).
+
+**tapad decays slowly, cliff at 129.** HEM-HEM strongest (77% at size 2-4,
+still 42% at 65-128). IDFA-IDFA ~40-44% flat from 13 to 128. AAID-IDFA
+(cross-OS) weakest, ~21% at every size. All type pairs collapse at 129+.
+
+Cumulative share by cap (pairs kept / agrees kept / agree % of kept):
+
+| cap | liid | tapad |
+|---|---|---|
+| 16 | 0.4% / 6% / 40.6 | 32% / 39% / 52.4 |
+| 32 | 2.9% / 30% / 24.0 | 69% / 75% / 46.4 |
+| 64 | 58% / 82% / 3.2 | 95% / 97% / 43.1 |
+| 128 | 97% / 99% / 2.3 | ~100% / 100% / 42.1 |
+
+**Corroboration is the strongest signal.** Pairs linked by both liid and
+tapad: 60-75% agree across all type pairs (AAID-AAID 72.8, IDFA-IDFA 74.9,
+HEM-IDFA 70.3), vs liid-only 1-12% and tapad-only 18-61%. Volume is small
+(~2.9M pairs).
+
+**Answers to the earlier questions:**
+- HEM-IDFA vs HEM-HEM: depends on via. In tapad HEM-HEM (61%) beats
+  HEM-IDFA (31%). In liid, HEM-IDFA is the best pair; there is no HEM-HEM.
+- HEM(liid) vs HEM(tapad), same size: liid HEM-IDFA at <=16 is ~62% vs
+  tapad 34-54%; liid AAID-HEM ~53% vs tapad 37-56%. Comparable or better
+  for liid at small sizes; much worse at large sizes.
+- Caveat: liid agreement may be inflated by LiveIntent-sourced crosswalk
+  rows (Vendor check still deferred).
+
+**Implications (candidate levers, to verify with Step 3 holdout):**
+1. Per-via caps instead of one MAX_FANOUT: liid ~16 (maybe 24), tapad
+   ~64-128. IDGraph5's global 16 is right for liid but throws away ~60% of
+   tapad's agreeing pairs; raising tapad's cap should cut singletons at little
+   precision cost (§11: median node's smallest group ~16).
+2. Down-weight or drop tapad AAID-IDFA (cross-OS, ~21%: household/shared?).
+3. Corroborated (liid+tapad) pairs deserve the highest weight.
+
+## 14. Component quality vs Affinity: design for notebooks A + B (agreed 2026-11-04)
+
+Simpler, component-level follow-up to §12-13 (pairs explain *why*; this
+scores *outcomes*). Not built yet. Every join staged; standard config block;
+Affinity used only to label/evaluate, never to split or merge a specific
+component (§ Affinity = labels only).
+
+### Definitions (agreed)
+- **Class** per component (singletons included): join its nodes to the
+  crosswalk, count distinct `AFS_INDIVIDUAL_ID`s. **0** = none matched,
+  **1** = exactly one, **2** = more than one. Unmatched nodes (TTD, cookies)
+  don't count against a match. A node mapping to 2 AFS ids just yields 2 -> class 2.
+- **Over-merged** (component flag) = class 2.
+- **Incomplete** (component flag) = some AFS person in this component also has
+  IDs in another component.
+- **Judgeable** = >= 2 matched IDs (class 2 was possible).
+- **% over-merged** = over-merged / (class 1 + class 2) components; also an
+  ID-weighted version.
+- **% people split** = AFS people whose matched IDs fall in 2+ of our
+  components / AFS people with 2+ IDs in our graph. Headline under-merge
+  number; the incomplete flag carries it into per-component breakdowns.
+- Percentages are flags counted over a group of components (whole graph or a
+  breakdown cell); per component there are only flags.
+
+### Notebook A -- foundation (`IDGraph_Component_Quality_Databricks.py`)
+Inputs: GRAPH_ROOT (IDGraph5 default, any build) + its MAX_FANOUT; build
+`via_keys`, `{via}_filtered_base`, `{via}_fanout`, `cc_output/result`;
+`node_labels` from edge labels (graph-independent).
+`SCORE_SPLIT = "tune"`: only AFS people in that split count as matches (others
+treated as unmatched); `"holdout"` writes a separate output dir for final scoring.
+
+Per component: class, over_merged, incomplete, judgeable, size, n matched IDs,
+n AFS people, sources (via_types whose links built it), ID types (HEM only /
+MAID only / HEM+MAID / neither; MAID = IDFA or AAID), largest group size per
+source.
+
+Per node token, stored as counts per component: **token = source set x ID
+type** (e.g. `liid+tapad:HEM`, `tapad:TTD`), source set = sources whose links
+include that node *in this component*. One token per node (no double counting
+across sources), all ID types.
+
+Singletons: source set from raw source data (`{via}_filtered_base`) + why
+alone per source: alone in group / dropped by cap (+ dropped group size) /
+denylisted. Every node comes from some source, so singletons always have one.
+
+Per AFS person (with 2+ IDs in our graph): together vs split.
+
+Tables: breakdowns by size, sources, ID types, sources x size (class shares,
+% over-merged, % incomplete); singletons by source x reason; headline
+% over-merged (component- and ID-weighted) and % people split.
+
+### Notebook B -- models (`IDGraph_Component_Quality_Models_Databricks.py`)
+Reads A's outputs so several models are compared on one foundation.
+Two binary targets:
+- over-merged: trains on judgeable components only when
+  `OVERMERGE_TRAIN_JUDGEABLE_ONLY = True` (default; a component with 1 matched
+  ID can never be class 2 and would teach "less Affinity data = good").
+- incomplete: components with >= 1 matched ID (mainly singletons).
+
+Models:
+1. Lookup baseline: cell rate by sources x ID types x size bucket, thin cells
+   fall back to coarser.
+2. Bayesian naive Bayes: token rate =
+   `(own over + PRIOR_STRENGTH * type_rate) / (own total + PRIOR_STRENGTH)`,
+   type_rate = pooled empirical rate of the token's ID type (dominated by the
+   biggest source automatically); unknown type -> global rate.
+   `PRIOR_STRENGTH = 100`; optional beta-binomial fit. A token never seen
+   (e.g. `id5+liid+tapad:AAID` = 0) sits at its type rate until data arrives.
+   "most reliable source" mode dropped -- the prior covers it.
+   Anti-saturation (a 500-node component would otherwise go to 0%/100%):
+   token shares + size as a separate input, then calibration.
+3. Logistic regression: log(size), source shares, ID-type shares, largest group
+   size per source, singleton reason.
+Evaluation: train tune, test holdout (A's holdout output): AUC, calibration
+by 10% band, lift over the lookup baseline. Outputs: P(over-merged) and
+P(incomplete) for every component, token rate table, model comparison.
+TTD's effect IS learnable (TTD nodes sit in judged components) but scores for
+TTD-only components are extrapolation.
+
+### Use
+- Compare graphs: run A on IDGraph4 / IDGraph5 / per-source-cap build; compare
+  headline numbers.
+- Break up clusters: what predicts high P(over-merged) -> stricter rules.
+- Re-link singletons: high P(incomplete) + "dropped by cap" reasons -> which
+  groups to re-add (e.g. tapad 17-64).
+- Rules use only our own data; confirmed on holdout.
