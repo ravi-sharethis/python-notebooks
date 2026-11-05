@@ -851,3 +851,19 @@ TTD-only components are extrapolation.
 - Re-link singletons: high P(incomplete) + "dropped by cap" reasons -> which
   groups to re-add (e.g. tapad 17-64).
 - Rules use only our own data; confirmed on holdout.
+
+**2026-11-04 first Databricks runs of notebook A -- two fixes:**
+1. `staging_df.check_if_dataframe_exists` returned True for missing paths on
+   Spark Connect (job cluster 18.x, DATA_SECURITY_MODE_AUTO): reads are lazy, so
+   every stage was skipped. Fixed by touching `.schema` (bf4fe2a).
+2. 8 x rd-fleet.xlarge (~150GB local disk each, elastic disk off) ran out of
+   local disk at `node_sources` (shuffle + dbio disk cache). Added
+   `in_slice` / `stage_sliced` to staging_df.py: heavy steps run in N_SLICES
+   passes by node/component hash, each slice staged at `{path}/slice=<i>`.
+   Config `SLICE_HEAVY_STEPS = True`, `N_SLICES = 8` in A and B; disk cache
+   disabled in both. Sliced in A: node_sources, nodes, component_structure,
+   component_tokens, matched_nodes, component_summary. In B: features,
+   nb_token_counts (+ total), nb_scores, model_inputs, train_rows, eval_hist
+   (+ total); lookup_rates now built from train_rows. Sliced vs unsliced
+   identical on synthetic data. Job: A(tune) -> A(holdout, widget
+   SCORE_SPLIT=holdout) -> B.

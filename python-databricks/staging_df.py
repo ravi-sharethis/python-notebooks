@@ -156,7 +156,37 @@ def stage_dataframe(
 
     return decorator
 
-""" sample usage 
+def in_slice(col_name, slice_id, n_slices):
+    """Row filter for one slice of a hash split on `col_name`. Always true when
+    n_slices <= 1, so a sliced function also works unsliced."""
+    from pyspark.sql import functions as F
+
+    if n_slices <= 1:
+        return F.lit(True)
+    return F.pmod(F.xxhash64(F.col(col_name)), F.lit(n_slices)) == F.lit(slice_id)
+
+
+def stage_sliced(staged_fn, *args, spark, write_path, n_slices=1, **kwargs):
+    """Run a @stage_dataframe function once per slice, so each run shuffles only
+    1/n_slices of the data (bounds local disk on big joins/groupBys).
+
+    staged_fn must accept slice_id / n_slices and filter its inputs with
+    in_slice(). Slices are staged separately at {write_path}/slice=<i>, so a
+    crash resumes at the first unfinished slice. Returns all slices read back
+    (without the `slice` partition column). n_slices <= 1 runs it once,
+    unsliced, at write_path.
+
+    Don't change n_slices for a write_path that already has slices on disk --
+    delete the folder first.
+    """
+    if n_slices <= 1:
+        return staged_fn(*args, spark=spark, write_path=write_path, slice_id=0, n_slices=1, **kwargs)
+    for i in range(n_slices):
+        staged_fn(*args, spark=spark, write_path=f"{write_path}/slice={i}", slice_id=i, n_slices=n_slices, **kwargs)
+    return spark.read.parquet(write_path).drop("slice")
+
+
+""" sample usage
 
     # spark & write_path are required function signatures
 

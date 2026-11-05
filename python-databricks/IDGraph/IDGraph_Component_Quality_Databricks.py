@@ -38,6 +38,9 @@ spark.conf.set("spark.databricks.optimizer.adaptive.enabled", "true")
 spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "true")
 spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
 spark.conf.set("spark.databricks.delta.optimizeWrite.enabled", "true")
+# One-pass job: the disk cache only competes with shuffle files for local disk
+# (a "No space left on device" in dbio_cache_root killed an earlier run).
+spark.conf.set("spark.databricks.io.cache.enabled", "false")
 
 # COMMAND ----------
 
@@ -54,7 +57,7 @@ sys.path.append(os.path.abspath(".."))
 
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
-from staging_df import _path_exists, stage_dataframe
+from staging_df import _path_exists, in_slice, stage_dataframe, stage_sliced
 
 # COMMAND ----------
 
@@ -103,6 +106,14 @@ DENYLIST = {
         "No8xjSC1%2BF8tmUR6x2oK%2BwN5kOn4r6EQMogME9KNx4Ef6i2iPbTIaEY8POYimlBf",
     },
 }
+
+# The heaviest steps (node_sources, nodes, component structure/tokens, matched
+# nodes, component_summary) run in N_SLICES passes, each shuffling 1/N of the
+# data -- bounds local disk on small clusters at the cost of re-reading inputs
+# N times. Don't change N_SLICES once a sliced step has slices on disk.
+SLICE_HEAVY_STEPS = True
+N_SLICES = 8
+_N = N_SLICES if SLICE_HEAVY_STEPS else 1
 
 TYPE_SHORT = {"HEM_MD5": "HEM", "HARDWARE_IDFA": "IDFA", "HARDWARE_ANDROID_AD_ID": "AAID"}
 MAID_TYPES = ["HARDWARE_IDFA", "HARDWARE_ANDROID_AD_ID"]
@@ -231,9 +242,12 @@ def _apply_caps(df, via_label):
 
 
 @stage_dataframe(write_format="parquet")
-def node_sources_fn(parts, spark=None, write_path=None):
+def node_sources_fn(parts, slice_id=0, n_slices=1, spark=None, write_path=None):
     # parts are in VIA_KEY_COLS order (built by the list comprehension above).
-    capped_parts = [_apply_caps(p, via_label) for p, (via_label, _) in zip(parts, VIA_KEY_COLS)]
+    capped_parts = [
+        _apply_caps(p.filter(in_slice("node_id", slice_id, n_slices)), via_label)
+        for p, (via_label, _) in zip(parts, VIA_KEY_COLS)
+    ]
     unioned = capped_parts[0]
     for p in capped_parts[1:]:
         unioned = unioned.unionByName(p)
@@ -255,7 +269,9 @@ def node_sources_fn(parts, spark=None, write_path=None):
     )
 
 
-node_sources = node_sources_fn(node_via_groups, spark=spark, write_path=f"{GRAPH_PATH}/node_sources")
+node_sources = stage_sliced(
+    node_sources_fn, node_via_groups, spark=spark, write_path=f"{GRAPH_PATH}/node_sources", n_slices=_N
+)
 
 # COMMAND ----------
 
@@ -276,20 +292,21 @@ result = spark.read.format("delta").load(RESULT_PATH)
 
 
 @stage_dataframe(write_format="parquet")
-def nodes_fn(result_df, node_sources_df, spark=None, write_path=None):
+def nodes_fn(result_df, node_sources_df, slice_id=0, n_slices=1, spark=None, write_path=None):
     return (
         result_df.select(F.col("id").alias("node_id"), "component", "component_size")
-        .join(node_sources_df, on="node_id", how="left")
+        .filter(in_slice("node_id", slice_id, n_slices))
+        .join(node_sources_df.filter(in_slice("node_id", slice_id, n_slices)), on="node_id", how="left")
         .withColumn("type", _node_type())
     )
 
 
 @stage_dataframe(write_format="parquet")
-def component_structure_fn(nodes_df, spark=None, write_path=None):
+def component_structure_fn(nodes_df, slice_id=0, n_slices=1, spark=None, write_path=None):
     group = _type_group("type")
     per_via = [F.max(f"max_group_size_{v}").alias(f"max_group_size_{v}") for v in VIA_LABELS]
     s = (
-        nodes_df.filter(F.col("component_size") > 1)
+        nodes_df.filter((F.col("component_size") > 1) & in_slice("component", slice_id, n_slices))
         .groupBy("component")
         .agg(
             F.first("component_size").alias("component_size"),
@@ -308,10 +325,10 @@ def component_structure_fn(nodes_df, spark=None, write_path=None):
 
 
 @stage_dataframe(write_format="parquet")
-def component_tokens_fn(nodes_df, spark=None, write_path=None):
+def component_tokens_fn(nodes_df, slice_id=0, n_slices=1, spark=None, write_path=None):
     token = F.concat(F.coalesce(F.col("source_set"), F.lit("unlinked")), F.lit(":"), _type_short("type"))
     return (
-        nodes_df.filter(F.col("component_size") > 1)
+        nodes_df.filter((F.col("component_size") > 1) & in_slice("component", slice_id, n_slices))
         .groupBy("component", token.alias("token"))
         .agg(F.count("*").alias("n_nodes"))
     )
@@ -335,9 +352,13 @@ def singletons_fn(nodes_df, spark=None, write_path=None):
     )
 
 
-nodes = nodes_fn(result, node_sources, spark=spark, write_path=f"{GRAPH_PATH}/nodes")
-component_structure = component_structure_fn(nodes, spark=spark, write_path=f"{GRAPH_PATH}/component_structure")
-component_tokens = component_tokens_fn(nodes, spark=spark, write_path=f"{GRAPH_PATH}/component_tokens")
+nodes = stage_sliced(nodes_fn, result, node_sources, spark=spark, write_path=f"{GRAPH_PATH}/nodes", n_slices=_N)
+component_structure = stage_sliced(
+    component_structure_fn, nodes, spark=spark, write_path=f"{GRAPH_PATH}/component_structure", n_slices=_N
+)
+component_tokens = stage_sliced(
+    component_tokens_fn, nodes, spark=spark, write_path=f"{GRAPH_PATH}/component_tokens", n_slices=_N
+)
 singletons = singletons_fn(nodes, spark=spark, write_path=f"{GRAPH_PATH}/singletons")
 
 _n_unlinked = component_structure.filter(F.col("n_unlinked") > 0).count()
@@ -360,9 +381,15 @@ node_labels = spark.read.parquet(NODE_LABELS_PATH)
 
 
 @stage_dataframe(write_format="parquet")
-def matched_nodes_fn(result_df, labels_df, spark=None, write_path=None):
-    labels = labels_df.filter(F.col("split") == SCORE_SPLIT).select("node_id", "afs_ids")
-    return result_df.select(F.col("id").alias("node_id"), "component").join(labels, on="node_id")
+def matched_nodes_fn(result_df, labels_df, slice_id=0, n_slices=1, spark=None, write_path=None):
+    labels = labels_df.filter(
+        (F.col("split") == SCORE_SPLIT) & in_slice("node_id", slice_id, n_slices)
+    ).select("node_id", "afs_ids")
+    return (
+        result_df.select(F.col("id").alias("node_id"), "component")
+        .filter(in_slice("node_id", slice_id, n_slices))
+        .join(labels, on="node_id")
+    )
 
 
 @stage_dataframe(write_format="parquet")
@@ -395,7 +422,9 @@ def component_matches_fn(matched_df, component_afs_df, person_df, spark=None, wr
     return n_matched.join(per_comp, on="component")
 
 
-matched_nodes = matched_nodes_fn(result, node_labels, spark=spark, write_path=f"{SPLIT_PATH}/matched_nodes")
+matched_nodes = stage_sliced(
+    matched_nodes_fn, result, node_labels, spark=spark, write_path=f"{SPLIT_PATH}/matched_nodes", n_slices=_N
+)
 component_afs = component_afs_fn(matched_nodes, spark=spark, write_path=f"{SPLIT_PATH}/component_afs")
 person_spread = person_spread_fn(component_afs, spark=spark, write_path=f"{SPLIT_PATH}/person_spread")
 component_matches = component_matches_fn(
@@ -413,9 +442,10 @@ component_matches = component_matches_fn(
 
 
 @stage_dataframe(write_format="parquet")
-def component_summary_fn(structure_df, singletons_df, matches_df, spark=None, write_path=None):
+def component_summary_fn(structure_df, singletons_df, matches_df, slice_id=0, n_slices=1, spark=None, write_path=None):
     group = _type_group("type")
-    single = singletons_df.select(
+    this_slice = in_slice("component", slice_id, n_slices)
+    single = singletons_df.filter(this_slice).select(
         "component",
         F.lit(1).cast("long").alias("component_size"),
         (group == "HEM").cast("long").alias("n_hem"),
@@ -428,10 +458,10 @@ def component_summary_fn(structure_df, singletons_df, matches_df, spark=None, wr
         "min_dropped_size",
         *[f"dropped_size_{v}" for v in VIA_LABELS],
     )
-    multi = structure_df.drop("n_unlinked")
+    multi = structure_df.filter(this_slice).drop("n_unlinked")
     s = (
         multi.unionByName(single, allowMissingColumns=True)
-        .join(matches_df, on="component", how="left")
+        .join(matches_df.filter(this_slice), on="component", how="left")
         .fillna({"n_matched": 0, "n_afs": 0, "incomplete": 0})
     )
     cls = F.when(F.col("n_afs") == 0, 0).when(F.col("n_afs") == 1, 1).otherwise(2)
@@ -455,8 +485,14 @@ def component_summary_fn(structure_df, singletons_df, matches_df, spark=None, wr
     )
 
 
-component_summary = component_summary_fn(
-    component_structure, singletons, component_matches, spark=spark, write_path=f"{SPLIT_PATH}/component_summary"
+component_summary = stage_sliced(
+    component_summary_fn,
+    component_structure,
+    singletons,
+    component_matches,
+    spark=spark,
+    write_path=f"{SPLIT_PATH}/component_summary",
+    n_slices=_N,
 )
 
 # COMMAND ----------

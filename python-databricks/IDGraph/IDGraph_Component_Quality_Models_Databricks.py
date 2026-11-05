@@ -48,6 +48,8 @@ spark.conf.set("spark.databricks.optimizer.adaptive.enabled", "true")
 spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "true")
 spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
 spark.conf.set("spark.databricks.delta.optimizeWrite.enabled", "true")
+# One-pass job: the disk cache only competes with shuffle files for local disk.
+spark.conf.set("spark.databricks.io.cache.enabled", "false")
 
 # COMMAND ----------
 
@@ -64,7 +66,7 @@ sys.path.append(os.path.abspath(".."))
 
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
-from staging_df import _path_exists, stage_dataframe
+from staging_df import _path_exists, in_slice, stage_dataframe, stage_sliced
 
 # COMMAND ----------
 
@@ -116,6 +118,13 @@ SEED = 7
 
 # Predictions are binned this finely for AUC / calibration (cheap, exact to 0.001).
 N_SCORE_BINS = 1000
+
+# Steps that shuffle every component (features, NB token counts / scores, model
+# inputs, training rows, eval histogram) run in N_SLICES passes by component
+# hash. Don't change N_SLICES once a sliced step has slices on disk.
+SLICE_HEAVY_STEPS = True
+N_SLICES = 8
+_N = N_SLICES if SLICE_HEAVY_STEPS else 1
 
 DROPPED_SIZE_BOUNDS = [16, 24, 32, 48, 64, 128, 256, 1024]
 
@@ -190,9 +199,10 @@ LR_FEATURES = (
 
 
 @stage_dataframe(write_format="parquet")
-def features_fn(summary_df, tokens_df, spark=None, write_path=None):
+def features_fn(summary_df, tokens_df, slice_id=0, n_slices=1, spark=None, write_path=None):
+    this_slice = in_slice("component", slice_id, n_slices)
     src = F.split(F.substring_index("token", ":", 1), "\\+")
-    src_counts = tokens_df.groupBy("component").agg(
+    src_counts = tokens_df.filter(this_slice).groupBy("component").agg(
         *[F.sum(F.when(F.array_contains(src, v), F.col("n_nodes")).otherwise(0)).alias(f"n_src_{v}") for v in VIA_LABELS]
     )
     keep = (
@@ -201,7 +211,7 @@ def features_fn(summary_df, tokens_df, spark=None, write_path=None):
         + [f"max_group_size_{v}" for v in VIA_LABELS]
         + [f"dropped_size_{v}" for v in VIA_LABELS]
     )
-    f = summary_df.select(*keep).join(src_counts, on="component", how="left")
+    f = summary_df.filter(this_slice).select(*keep).join(src_counts, on="component", how="left")
     size = F.col("component_size").cast("double")
     reasons = F.coalesce(F.col("singleton_reasons"), F.lit(""))
     dropped_bucket = F.when(F.col("min_dropped_size").isNull(), F.lit("-")).otherwise(
@@ -239,11 +249,14 @@ def labels_fn(summary_df, target, spark=None, write_path=None):
     return rows.select("component", F.col(target).cast("double").alias("label"))
 
 
-component_tokens = spark.read.parquet(f"{GRAPH_PATH}/component_tokens")
-train_summary = spark.read.parquet(f"{TRAIN_SPLIT_PATH}/component_summary")
-eval_summary = spark.read.parquet(f"{EVAL_SPLIT_PATH}/component_summary")
+# Notebook A may have written these in slices -- drop the partition column.
+component_tokens = spark.read.parquet(f"{GRAPH_PATH}/component_tokens").drop("slice")
+train_summary = spark.read.parquet(f"{TRAIN_SPLIT_PATH}/component_summary").drop("slice")
+eval_summary = spark.read.parquet(f"{EVAL_SPLIT_PATH}/component_summary").drop("slice")
 
-features = features_fn(train_summary, component_tokens, spark=spark, write_path=f"{MODELS_PATH}/features")
+features = stage_sliced(
+    features_fn, train_summary, component_tokens, spark=spark, write_path=f"{MODELS_PATH}/features", n_slices=_N
+)
 train_labels = {
     t: labels_fn(train_summary, t, spark=spark, write_path=f"{MODELS_PATH}/labels_tune_{t}") for t in TARGETS
 }
@@ -288,8 +301,9 @@ all_tokens = all_tokens_fn(component_tokens, features, spark=spark, write_path=f
 
 
 @stage_dataframe(write_format="parquet")
-def lookup_rates_fn(features_df, labels_df, spark=None, write_path=None):
-    rows = features_df.join(labels_df, on="component")
+def lookup_rates_fn(train_rows_df, spark=None, write_path=None):
+    # train_rows = features x labels, so no join here.
+    rows = train_rows_df
     parts = [
         rows.groupBy(F.concat_ws("|", *cols).alias("key"))
         .agg(F.count("*").alias("n"), F.sum("label").alias("n_pos"))
@@ -317,10 +331,7 @@ def _with_lookup(df, rates_df):
     return out.drop(*[f"_k{i}" for i in range(len(LOOKUP_LEVELS))], *[f"_p{i}" for i in range(len(LOOKUP_LEVELS))])
 
 
-lookup_rates = {
-    t: lookup_rates_fn(features, train_labels[t], spark=spark, write_path=f"{MODELS_PATH}/lookup_rates_{t}")
-    for t in TARGETS
-}
+# Computed after train_rows (below) -- it's a groupBy of those rows.
 
 # COMMAND ----------
 
@@ -334,12 +345,20 @@ lookup_rates = {
 
 
 @stage_dataframe(write_format="parquet")
-def nb_token_counts_fn(all_tokens_df, labels_df, spark=None, write_path=None):
+def nb_token_counts_fn(all_tokens_df, labels_df, slice_id=0, n_slices=1, spark=None, write_path=None):
+    this_slice = in_slice("component", slice_id, n_slices)
     return (
-        all_tokens_df.join(labels_df, on="component")
+        all_tokens_df.filter(this_slice)
+        .join(labels_df.filter(this_slice), on="component")
         .groupBy("token")
         .agg(F.sum("n_nodes").alias("n"), F.sum(F.col("n_nodes") * F.col("label")).alias("n_pos"))
     )
+
+
+@stage_dataframe(write_format="parquet")
+def nb_token_counts_total_fn(sliced_counts_df, spark=None, write_path=None):
+    # Per-slice counts -> one row per token (a no-op sum when unsliced).
+    return sliced_counts_df.groupBy("token").agg(F.sum("n").alias("n"), F.sum("n_pos").alias("n_pos"))
 
 
 def _beta_strength(g):
@@ -373,7 +392,7 @@ def nb_token_rates_fn(counts_df, spark=None, write_path=None):
 
 
 @stage_dataframe(write_format="parquet")
-def nb_scores_fn(all_tokens_df, rates_df, spark=None, write_path=None):
+def nb_scores_fn(all_tokens_df, rates_df, slice_id=0, n_slices=1, spark=None, write_path=None):
     """Per component: nb_sum = sum over nodes of (token log-odds - base log-odds)
     (classic NB evidence); nb_mean = node-weighted mean token log-odds."""
     tot = rates_df.agg(F.sum("n_pos") / F.sum("n")).first()[0]
@@ -381,7 +400,8 @@ def nb_scores_fn(all_tokens_df, rates_df, spark=None, write_path=None):
     p = _clip(F.coalesce(F.col("rate"), F.col("type_rate"), F.lit(tot)))
     base = float(np.log(tot / (1 - tot))) if 0 < tot < 1 else 0.0
     scored = (
-        all_tokens_df.withColumn("type", F.substring_index("token", ":", -1))
+        all_tokens_df.filter(in_slice("component", slice_id, n_slices))
+        .withColumn("type", F.substring_index("token", ":", -1))
         .join(F.broadcast(rates_df.select("token", "rate")), on="token", how="left")
         .join(F.broadcast(type_rates), on="type", how="left")
         .withColumn("token_logit", _logit(p))
@@ -395,9 +415,16 @@ def nb_scores_fn(all_tokens_df, rates_df, spark=None, write_path=None):
 nb_token_rates = {}
 nb_scores = {}
 for t in TARGETS:
-    _counts = nb_token_counts_fn(all_tokens, train_labels[t], spark=spark, write_path=f"{MODELS_PATH}/nb_token_counts_{t}")
+    _sliced = stage_sliced(
+        nb_token_counts_fn, all_tokens, train_labels[t],
+        spark=spark, write_path=f"{MODELS_PATH}/nb_token_counts_sliced_{t}", n_slices=_N,
+    )
+    _counts = nb_token_counts_total_fn(_sliced, spark=spark, write_path=f"{MODELS_PATH}/nb_token_counts_{t}")
     nb_token_rates[t] = nb_token_rates_fn(_counts, spark=spark, write_path=f"{MODELS_PATH}/nb_token_rates_{t}")
-    nb_scores[t] = nb_scores_fn(all_tokens, nb_token_rates[t], spark=spark, write_path=f"{MODELS_PATH}/nb_scores_{t}")
+    nb_scores[t] = stage_sliced(
+        nb_scores_fn, all_tokens, nb_token_rates[t],
+        spark=spark, write_path=f"{MODELS_PATH}/nb_scores_{t}", n_slices=_N,
+    )
 
 # COMMAND ----------
 
@@ -409,22 +436,37 @@ for t in TARGETS:
 
 
 @stage_dataframe(write_format="parquet")
-def model_inputs_fn(features_df, nb_df, spark=None, write_path=None):
-    return features_df.join(nb_df, on="component", how="left").fillna({"nb_sum": 0.0, "nb_mean": 0.0})
+def model_inputs_fn(features_df, nb_df, slice_id=0, n_slices=1, spark=None, write_path=None):
+    this_slice = in_slice("component", slice_id, n_slices)
+    return (
+        features_df.filter(this_slice)
+        .join(nb_df.filter(this_slice), on="component", how="left")
+        .fillna({"nb_sum": 0.0, "nb_mean": 0.0})
+    )
 
 
 @stage_dataframe(write_format="parquet")
-def train_rows_fn(inputs_df, labels_df, spark=None, write_path=None):
-    return inputs_df.join(labels_df, on="component")
+def train_rows_fn(inputs_df, labels_df, slice_id=0, n_slices=1, spark=None, write_path=None):
+    this_slice = in_slice("component", slice_id, n_slices)
+    return inputs_df.filter(this_slice).join(labels_df.filter(this_slice), on="component")
 
 
 model_inputs = {
-    t: model_inputs_fn(features, nb_scores[t], spark=spark, write_path=f"{MODELS_PATH}/model_inputs_{t}")
+    t: stage_sliced(
+        model_inputs_fn, features, nb_scores[t],
+        spark=spark, write_path=f"{MODELS_PATH}/model_inputs_{t}", n_slices=_N,
+    )
     for t in TARGETS
 }
 train_rows = {
-    t: train_rows_fn(model_inputs[t], train_labels[t], spark=spark, write_path=f"{MODELS_PATH}/train_rows_{t}")
+    t: stage_sliced(
+        train_rows_fn, model_inputs[t], train_labels[t],
+        spark=spark, write_path=f"{MODELS_PATH}/train_rows_{t}", n_slices=_N,
+    )
     for t in TARGETS
+}
+lookup_rates = {
+    t: lookup_rates_fn(train_rows[t], spark=spark, write_path=f"{MODELS_PATH}/lookup_rates_{t}") for t in TARGETS
 }
 
 # COMMAND ----------
@@ -497,8 +539,9 @@ scores = {
 
 
 @stage_dataframe(write_format="parquet")
-def eval_hist_fn(scores_df, labels_df, spark=None, write_path=None):
-    rows = scores_df.join(labels_df, on="component")
+def eval_hist_fn(scores_df, labels_df, slice_id=0, n_slices=1, spark=None, write_path=None):
+    this_slice = in_slice("component", slice_id, n_slices)
+    rows = scores_df.filter(this_slice).join(labels_df.filter(this_slice), on="component")
     long = rows.select(
         "stratum",
         "label",
@@ -511,9 +554,21 @@ def eval_hist_fn(scores_df, labels_df, spark=None, write_path=None):
     ).agg(F.count("*").alias("n"), F.sum("label").alias("n_pos"), F.sum("p").alias("sum_p"))
 
 
-eval_hists = {
-    t: eval_hist_fn(scores[t], eval_labels[t], spark=spark, write_path=f"{MODELS_PATH}/eval_hist_{t}") for t in TARGETS
-}
+@stage_dataframe(write_format="parquet")
+def eval_hist_total_fn(sliced_hist_df, spark=None, write_path=None):
+    # Per-slice histograms -> one (a no-op sum when unsliced).
+    return sliced_hist_df.groupBy("stratum", "model", "bin").agg(
+        F.sum("n").alias("n"), F.sum("n_pos").alias("n_pos"), F.sum("sum_p").alias("sum_p")
+    )
+
+
+eval_hists = {}
+for t in TARGETS:
+    _sliced = stage_sliced(
+        eval_hist_fn, scores[t], eval_labels[t],
+        spark=spark, write_path=f"{MODELS_PATH}/eval_hist_sliced_{t}", n_slices=_N,
+    )
+    eval_hists[t] = eval_hist_total_fn(_sliced, spark=spark, write_path=f"{MODELS_PATH}/eval_hist_{t}")
 
 
 def _auc(h):
