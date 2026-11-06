@@ -107,11 +107,13 @@ DENYLIST = {
     },
 }
 
-# The heaviest steps (node_sources, nodes, component structure/tokens, matched
-# nodes, component_summary) run in N_SLICES passes, each shuffling 1/N of the
-# data -- bounds local disk on small clusters at the cost of re-reading inputs
-# N times. Don't change N_SLICES once a sliced step has slices on disk.
-SLICE_HEAVY_STEPS = True
+# Off by default: run with elastic disk (autoscaling local storage) on the job
+# cluster. If a run still fills local disk, set True -- the heaviest steps (common
+# node_via_groups, nodes, component tokens/structure, matched nodes,
+# component_summary) then run in N_SLICES passes, each shuffling 1/N of the data,
+# at the cost of re-reading their inputs N times. Delete a step's folder before
+# changing SLICE_HEAVY_STEPS or N_SLICES for it.
+SLICE_HEAVY_STEPS = False
 N_SLICES = 8
 _N = N_SLICES if SLICE_HEAVY_STEPS else 1
 
@@ -174,37 +176,48 @@ DROPPED_SIZE_BOUNDS = [min(MAX_FANOUT.values()) + 1, 24, 32, 48, 64, 128, 256, 1
 # COMMAND ----------
 
 # MAGIC %md ## Common -- every node's group sizes per source (cap-independent)
-# MAGIC One pass of `{via}_filtered_base` x `{via}_fanout` per source: per node, the
-# MAGIC sorted distinct sizes of its non-denylisted keys, plus whether it has a
-# MAGIC denylisted key. Any graph's caps are applied to this later, so it's
-# MAGIC computed once and reused.
+# MAGIC `{via}_filtered_base` x `{via}_fanout` for all sources, unioned and grouped
+# MAGIC by node once: one row per node with, per source, the sorted distinct sizes
+# MAGIC of its non-denylisted keys (`group_sizes_{via}`) and whether it has a
+# MAGIC denylisted key (`any_denylisted_{via}`, null = node not in that source).
+# MAGIC Any graph's caps are applied to this later, row by row, so it's computed
+# MAGIC once and reused, and no graph has to shuffle by node again.
 
 # COMMAND ----------
 
 
 @stage_dataframe(write_format="parquet")
-def node_via_groups_fn(via_label, key_col, spark=None, write_path=None):
-    base = spark.read.parquet(f"{SOURCE_BUILD_PATH}/{via_label}_filtered_base").select("node_id", key_col)
-    fanout = spark.read.parquet(f"{SOURCE_BUILD_PATH}/{via_label}_fanout").select(key_col, "n_distinct")
-    deny = list(DENYLIST.get(via_label, set()))
-    is_deny = F.col(key_col).isin(deny) if deny else F.lit(False)
-    return (
-        base.join(fanout, on=key_col)
-        .withColumn("is_deny", is_deny)
-        .groupBy("node_id")
-        .agg(
-            # collect_set drops nulls, so denylisted keys are left out of group_sizes.
-            F.array_sort(F.collect_set(F.when(~F.col("is_deny"), F.col("n_distinct")))).alias("group_sizes"),
-            F.max(F.col("is_deny").cast("int")).alias("any_denylisted"),
+def node_via_groups_fn(slice_id=0, n_slices=1, spark=None, write_path=None):
+    parts = []
+    for via_label, key_col in VIA_KEY_COLS:
+        base = (
+            spark.read.parquet(f"{SOURCE_BUILD_PATH}/{via_label}_filtered_base")
+            .select("node_id", key_col)
+            .filter(in_slice("node_id", slice_id, n_slices))
         )
-        .withColumn("via_type", F.lit(via_label))
-    )
+        fanout = spark.read.parquet(f"{SOURCE_BUILD_PATH}/{via_label}_fanout").select(key_col, "n_distinct")
+        deny = list(DENYLIST.get(via_label, set()))
+        is_deny = F.col(key_col).isin(deny) if deny else F.lit(False)
+        parts.append(
+            base.join(fanout, on=key_col).select(
+                "node_id", F.lit(via_label).alias("via_type"), "n_distinct", is_deny.alias("is_deny")
+            )
+        )
+    unioned = parts[0]
+    for p in parts[1:]:
+        unioned = unioned.unionByName(p)
+    aggs = []
+    for v in VIA_LABELS:
+        is_v = F.col("via_type") == v
+        # collect_set drops nulls, so other sources' rows and denylisted keys are left out.
+        aggs.append(F.array_sort(F.collect_set(F.when(is_v & ~F.col("is_deny"), F.col("n_distinct")))).alias(f"group_sizes_{v}"))
+        aggs.append(F.max(F.when(is_v, F.col("is_deny").cast("int"))).alias(f"any_denylisted_{v}"))
+    return unioned.groupBy("node_id").agg(*aggs)
 
 
-node_via_groups = [
-    node_via_groups_fn(via_label, key_col, spark=spark, write_path=f"{COMMON_PATH}/node_via_groups_{via_label}")
-    for via_label, key_col in VIA_KEY_COLS
-]
+node_via_groups = stage_sliced(
+    node_via_groups_fn, spark=spark, write_path=f"{COMMON_PATH}/node_via_groups", n_slices=_N
+)
 
 # COMMAND ----------
 
@@ -218,60 +231,57 @@ node_via_groups = [
 # MAGIC `source_set` = sources that link the node (null = none: should be a
 # MAGIC singleton); `raw_source_set` = every source it appears in;
 # MAGIC `singleton_reasons` = reasons from the sources that don't link it.
+# MAGIC Row by row on `node_via_groups` -- no shuffle.
 
 # COMMAND ----------
 
 
-def _apply_caps(df, via_label):
+def _reason(via_label):
     cap = MAX_FANOUT[via_label]
-    kept = F.filter("group_sizes", lambda x: (x >= 2) & (x <= cap))
-    dropped = F.filter("group_sizes", lambda x: x > cap)
+    sizes = F.col(f"group_sizes_{via_label}")
+    deny = F.col(f"any_denylisted_{via_label}")
+    kept = F.filter(sizes, lambda x: (x >= 2) & (x <= cap))
+    dropped = F.filter(sizes, lambda x: x > cap)
     reason = (
-        F.when(F.size(kept) > 0, F.lit("linked"))
+        F.when(deny.isNull(), F.lit(None).cast("string"))  # not in this source
+        .when(F.size(kept) > 0, F.lit("linked"))
         .when(F.size(dropped) > 0, F.lit("dropped"))
-        .when(F.col("any_denylisted") == 1, F.lit("denylisted"))
+        .when(deny == 1, F.lit("denylisted"))
         .otherwise(F.lit("alone"))
     )
-    return df.select(
-        "node_id",
-        "via_type",
-        reason.alias("reason"),
-        F.array_max(kept).alias("max_kept_size"),
-        F.array_min(dropped).alias("min_dropped_size"),
-    )
+    return reason, F.array_max(kept), F.array_min(dropped)
 
 
 @stage_dataframe(write_format="parquet")
-def node_sources_fn(parts, slice_id=0, n_slices=1, spark=None, write_path=None):
-    # parts are in VIA_KEY_COLS order (built by the list comprehension above).
-    capped_parts = [
-        _apply_caps(p.filter(in_slice("node_id", slice_id, n_slices)), via_label)
-        for p, (via_label, _) in zip(parts, VIA_KEY_COLS)
-    ]
-    unioned = capped_parts[0]
-    for p in capped_parts[1:]:
-        unioned = unioned.unionByName(p)
-    linked = F.col("reason") == "linked"
-    unlinked_dropped = F.when(F.col("reason") == "dropped", F.col("min_dropped_size"))
-    per_via = []
+def node_sources_fn(groups_df, spark=None, write_path=None):
+    cols = {}
     for v in VIA_LABELS:
-        is_v = F.col("via_type") == v
-        per_via.append(F.max(F.when(is_v, F.col("max_kept_size"))).alias(f"max_group_size_{v}"))
-        per_via.append(F.max(F.when(is_v, unlinked_dropped)).alias(f"dropped_size_{v}"))
-    return unioned.groupBy("node_id").agg(
-        _sorted_join(F.collect_set(F.when(linked, F.col("via_type")))).alias("source_set"),
-        _sorted_join(F.collect_set("via_type")).alias("raw_source_set"),
-        _sorted_join(
-            F.collect_list(F.when(~linked, F.concat("via_type", F.lit(":"), "reason")))
-        ).alias("singleton_reasons"),
-        F.min(unlinked_dropped).alias("min_dropped_size"),
-        *per_via,
+        reason, max_kept, min_dropped = _reason(v)
+        cols[f"reason_{v}"] = reason
+        cols[f"max_group_size_{v}"] = F.when(reason == "linked", max_kept)
+        cols[f"dropped_size_{v}"] = F.when(reason == "dropped", min_dropped)
+    df = groups_df.select("node_id", *[c.alias(name) for name, c in cols.items()])
+
+    def labels(cond_fn):
+        # array_compact drops the nulls from sources where cond_fn is false.
+        return F.array_compact(F.array(*[F.when(cond_fn(v), F.lit(v)) for v in VIA_LABELS]))
+
+    reasons = F.array_compact(F.array(*[
+        F.when(F.col(f"reason_{v}") != "linked", F.concat(F.lit(f"{v}:"), F.col(f"reason_{v}")))
+        for v in VIA_LABELS
+    ]))
+    return df.select(
+        "node_id",
+        _sorted_join(labels(lambda v: F.col(f"reason_{v}") == "linked")).alias("source_set"),
+        _sorted_join(labels(lambda v: F.col(f"reason_{v}").isNotNull())).alias("raw_source_set"),
+        _sorted_join(reasons).alias("singleton_reasons"),
+        F.least(*[F.col(f"dropped_size_{v}") for v in VIA_LABELS]).alias("min_dropped_size"),
+        *[F.col(f"max_group_size_{v}") for v in VIA_LABELS],
+        *[F.col(f"dropped_size_{v}") for v in VIA_LABELS],
     )
 
 
-node_sources = stage_sliced(
-    node_sources_fn, node_via_groups, spark=spark, write_path=f"{GRAPH_PATH}/node_sources", n_slices=_N
-)
+node_sources = node_sources_fn(node_via_groups, spark=spark, write_path=f"{GRAPH_PATH}/node_sources")
 
 # COMMAND ----------
 
@@ -282,6 +292,9 @@ node_sources = stage_sliced(
 # MAGIC match the build, or filtered_base differs from it):
 # MAGIC - nodes in components of size >= 2 that no source links (`n_unlinked`)
 # MAGIC - singletons that some source links, or that appear in no source
+# MAGIC
+# MAGIC `component_tokens` is the one group-by over all nodes; `component_structure`
+# MAGIC rolls it up by component.
 # MAGIC
 # MAGIC Token = source set x ID type, one per node (e.g. `liid+tapad:HEM`,
 # MAGIC `tapad:TTD`). HEM_MD5/IDFA/AAID are shortened; other types keep their name.
@@ -302,18 +315,37 @@ def nodes_fn(result_df, node_sources_df, slice_id=0, n_slices=1, spark=None, wri
 
 
 @stage_dataframe(write_format="parquet")
-def component_structure_fn(nodes_df, slice_id=0, n_slices=1, spark=None, write_path=None):
-    group = _type_group("type")
+def component_tokens_fn(nodes_df, slice_id=0, n_slices=1, spark=None, write_path=None):
+    # The one pass over all nodes grouped by component: token counts, plus what
+    # component_structure needs (it rolls this much smaller table up by component).
+    token = F.concat(F.coalesce(F.col("source_set"), F.lit("unlinked")), F.lit(":"), _type_short("type"))
+    per_via = [F.max(f"max_group_size_{v}").alias(f"max_group_size_{v}") for v in VIA_LABELS]
+    return (
+        nodes_df.filter((F.col("component_size") > 1) & in_slice("component", slice_id, n_slices))
+        .groupBy("component", token.alias("token"))
+        .agg(
+            F.count("*").alias("n_nodes"),
+            F.first("component_size").alias("component_size"),
+            # The token fixes the node type and whether it's linked, so these are constant per row.
+            F.first(_type_group("type")).alias("type_group"),
+            F.first(F.col("source_set").isNull()).alias("unlinked"),
+            *per_via,
+        )
+    )
+
+
+@stage_dataframe(write_format="parquet")
+def component_structure_fn(tokens_df, slice_id=0, n_slices=1, spark=None, write_path=None):
     per_via = [F.max(f"max_group_size_{v}").alias(f"max_group_size_{v}") for v in VIA_LABELS]
     s = (
-        nodes_df.filter((F.col("component_size") > 1) & in_slice("component", slice_id, n_slices))
+        tokens_df.filter(in_slice("component", slice_id, n_slices))
         .groupBy("component")
         .agg(
             F.first("component_size").alias("component_size"),
-            F.sum((group == "HEM").cast("long")).alias("n_hem"),
-            F.sum((group == "MAID").cast("long")).alias("n_maid"),
-            F.sum((group == "OTHER").cast("long")).alias("n_other"),
-            F.sum(F.col("source_set").isNull().cast("long")).alias("n_unlinked"),
+            F.sum(F.when(F.col("type_group") == "HEM", F.col("n_nodes")).otherwise(0)).alias("n_hem"),
+            F.sum(F.when(F.col("type_group") == "MAID", F.col("n_nodes")).otherwise(0)).alias("n_maid"),
+            F.sum(F.when(F.col("type_group") == "OTHER", F.col("n_nodes")).otherwise(0)).alias("n_other"),
+            F.sum(F.when(F.col("unlinked"), F.col("n_nodes")).otherwise(0)).alias("n_unlinked"),
             *per_via,
         )
     )
@@ -322,16 +354,6 @@ def component_structure_fn(nodes_df, slice_id=0, n_slices=1, spark=None, write_p
         "+", *[F.when(F.col(f"max_group_size_{v}").isNotNull(), F.lit(v)) for v in VIA_LABELS]
     )
     return s.withColumn("sources", sources)
-
-
-@stage_dataframe(write_format="parquet")
-def component_tokens_fn(nodes_df, slice_id=0, n_slices=1, spark=None, write_path=None):
-    token = F.concat(F.coalesce(F.col("source_set"), F.lit("unlinked")), F.lit(":"), _type_short("type"))
-    return (
-        nodes_df.filter((F.col("component_size") > 1) & in_slice("component", slice_id, n_slices))
-        .groupBy("component", token.alias("token"))
-        .agg(F.count("*").alias("n_nodes"))
-    )
 
 
 @stage_dataframe(write_format="parquet")
@@ -353,11 +375,11 @@ def singletons_fn(nodes_df, spark=None, write_path=None):
 
 
 nodes = stage_sliced(nodes_fn, result, node_sources, spark=spark, write_path=f"{GRAPH_PATH}/nodes", n_slices=_N)
-component_structure = stage_sliced(
-    component_structure_fn, nodes, spark=spark, write_path=f"{GRAPH_PATH}/component_structure", n_slices=_N
-)
 component_tokens = stage_sliced(
     component_tokens_fn, nodes, spark=spark, write_path=f"{GRAPH_PATH}/component_tokens", n_slices=_N
+)
+component_structure = stage_sliced(
+    component_structure_fn, component_tokens, spark=spark, write_path=f"{GRAPH_PATH}/component_structure", n_slices=_N
 )
 singletons = singletons_fn(nodes, spark=spark, write_path=f"{GRAPH_PATH}/singletons")
 

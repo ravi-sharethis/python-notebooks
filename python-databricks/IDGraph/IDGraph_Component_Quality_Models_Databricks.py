@@ -119,10 +119,11 @@ SEED = 7
 # Predictions are binned this finely for AUC / calibration (cheap, exact to 0.001).
 N_SCORE_BINS = 1000
 
-# Steps that shuffle every component (features, NB token counts / scores, model
-# inputs, training rows, eval histogram) run in N_SLICES passes by component
-# hash. Don't change N_SLICES once a sliced step has slices on disk.
-SLICE_HEAVY_STEPS = True
+# Off by default (run with elastic disk on the job cluster). If True, steps that
+# shuffle every component (features, NB token counts / scores, model inputs,
+# training rows, eval histogram) run in N_SLICES passes by component hash.
+# Delete a step's folder before changing SLICE_HEAVY_STEPS or N_SLICES for it.
+SLICE_HEAVY_STEPS = False
 N_SLICES = 8
 _N = N_SLICES if SLICE_HEAVY_STEPS else 1
 

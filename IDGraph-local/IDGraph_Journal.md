@@ -737,8 +737,9 @@ identical in IDGraph4), `{GRAPH_ROOT}/cc_output/result`,
 `IDGraph5/edge_labels/node_labels`. Config `MAX_FANOUT` is a per-source dict
 matching the scored build. Outputs by dependency:
 - `s3://data-science-research/ravi/IDGraph_common/component_quality/` --
-  `node_via_groups_{via}` (per node: sorted non-denylisted group sizes + deny
-  flag). Depends only on filtered_base + DENYLIST: reused by every graph.
+  `node_via_groups` (one row per node: per source, sorted non-denylisted group
+  sizes + deny flag). Depends only on filtered_base + DENYLIST: reused by every
+  graph. (Was three per-source tables `node_via_groups_{via}` before 2026-11-05.)
 - `{GRAPH_ROOT}/component_quality/graph/` -- `node_sources` (caps applied:
   source_set, raw_source_set, singleton_reasons, dropped sizes), `nodes`,
   `component_structure`, `component_tokens`, `singletons`. Shared by tune/holdout.
@@ -867,3 +868,27 @@ TTD-only components are extrapolation.
    (+ total); lookup_rates now built from train_rows. Sliced vs unsliced
    identical on synthetic data. Job: A(tune) -> A(holdout, widget
    SCORE_SPLIT=holdout) -> B.
+
+**2026-11-05 one node_id shuffle instead of two:** the common step used to group
+by node once per source (3 tables), then `node_sources` unioned them and grouped
+by node again -- a full 4.9B-row shuffle repeated for every graph. Now the common
+step unions the three `base x fanout` joins and groups by node once
+(`node_via_groups`, wide: `group_sizes_{via}`, `any_denylisted_{via}`; sliced),
+and `node_sources` applies the caps row by row with no shuffle (not sliced).
+Old vs new identical on synthetic data (node_sources row for row, all A+B
+outputs). Delete `IDGraph_common/.../node_via_groups_{via}` (unused) and
+`IDGraph5/component_quality/graph/node_sources` (partial slices from the failed
+run) before rerunning.
+
+Same day, after review of the joins: `component_tokens` is now the only group-by
+over all nodes (by component+token, also carrying component_size, type_group,
+unlinked, max_group_size_{via}); `component_structure` rolls that up by
+component -- one 4.9B-row shuffle instead of two. Extra token columns are
+ignored by B (it selects component/token/n_nodes). `SLICE_HEAVY_STEPS` now
+defaults to False in A and B: run with elastic disk on the job cluster (slicing
+re-read and re-shuffled `fanout` in every slice). Old vs new identical on
+synthetic data, sliced and unsliced (graph tables row for row, all printed A+B
+outputs). Still open: replace `filtered_base x fanout` by a count over key if
+`n_distinct` == filtered_base rows per key (check on Databricks first); broadcast
+hints for matched_nodes / component_summary if the Spark UI shows sort-merge
+joins with a small side.
