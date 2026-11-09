@@ -176,10 +176,15 @@ DROPPED_SIZE_BOUNDS = [min(MAX_FANOUT.values()) + 1, 24, 32, 48, 64, 128, 256, 1
 # COMMAND ----------
 
 # MAGIC %md ## Common -- every node's group sizes per source (cap-independent)
-# MAGIC `{via}_filtered_base` x `{via}_fanout` for all sources, unioned and grouped
-# MAGIC by node once: one row per node with, per source, the sorted distinct sizes
-# MAGIC of its non-denylisted keys (`group_sizes_{via}`) and whether it has a
-# MAGIC denylisted key (`any_denylisted_{via}`, null = node not in that source).
+# MAGIC 1. `node_key_sizes_{via}`: `{via}_filtered_base` x `{via}_fanout`, one source
+# MAGIC    at a time -- narrow distinct (node, group size, denylisted) rows. The only
+# MAGIC    shuffle of `fanout`, and AQE's skew join splits huge keys.
+# MAGIC 2. `node_via_groups`: those three unioned and grouped by node once -- one row
+# MAGIC    per node with, per source, the sorted distinct sizes of its non-denylisted
+# MAGIC    keys (`group_sizes_{via}`) and whether it has a denylisted key
+# MAGIC    (`any_denylisted_{via}`, null = node not in that source). If sliced, each
+# MAGIC    slice only re-reads the narrow tables.
+# MAGIC
 # MAGIC Any graph's caps are applied to this later, row by row, so it's computed
 # MAGIC once and reused, and no graph has to shuffle by node again.
 
@@ -187,36 +192,40 @@ DROPPED_SIZE_BOUNDS = [min(MAX_FANOUT.values()) + 1, 24, 32, 48, 64, 128, 256, 1
 
 
 @stage_dataframe(write_format="parquet")
-def node_via_groups_fn(slice_id=0, n_slices=1, spark=None, write_path=None):
-    parts = []
-    for via_label, key_col in VIA_KEY_COLS:
-        base = (
-            spark.read.parquet(f"{SOURCE_BUILD_PATH}/{via_label}_filtered_base")
-            .select("node_id", key_col)
-            .filter(in_slice("node_id", slice_id, n_slices))
-        )
-        fanout = spark.read.parquet(f"{SOURCE_BUILD_PATH}/{via_label}_fanout").select(key_col, "n_distinct")
-        deny = list(DENYLIST.get(via_label, set()))
-        is_deny = F.col(key_col).isin(deny) if deny else F.lit(False)
-        parts.append(
-            base.join(fanout, on=key_col).select(
-                "node_id", F.lit(via_label).alias("via_type"), "n_distinct", is_deny.alias("is_deny")
-            )
-        )
-    unioned = parts[0]
-    for p in parts[1:]:
-        unioned = unioned.unionByName(p)
+def node_key_sizes_fn(via_label, key_col, spark=None, write_path=None):
+    base = spark.read.parquet(f"{SOURCE_BUILD_PATH}/{via_label}_filtered_base").select("node_id", key_col)
+    fanout = spark.read.parquet(f"{SOURCE_BUILD_PATH}/{via_label}_fanout").select(key_col, "n_distinct")
+    deny = list(DENYLIST.get(via_label, set()))
+    is_deny = F.col(key_col).isin(deny) if deny else F.lit(False)
+    return (
+        base.join(fanout, on=key_col)
+        .select("node_id", F.col("n_distinct").alias("size"), is_deny.alias("is_deny"))
+        .distinct()
+    )
+
+
+@stage_dataframe(write_format="parquet")
+def node_via_groups_fn(parts, slice_id=0, n_slices=1, spark=None, write_path=None):
+    # parts are in VIA_KEY_COLS order (built by the list comprehension below).
+    unioned = None
+    for p, v in zip(parts, VIA_LABELS):
+        p = p.filter(in_slice("node_id", slice_id, n_slices)).withColumn("via_type", F.lit(v))
+        unioned = p if unioned is None else unioned.unionByName(p)
     aggs = []
     for v in VIA_LABELS:
         is_v = F.col("via_type") == v
         # collect_set drops nulls, so other sources' rows and denylisted keys are left out.
-        aggs.append(F.array_sort(F.collect_set(F.when(is_v & ~F.col("is_deny"), F.col("n_distinct")))).alias(f"group_sizes_{v}"))
+        aggs.append(F.array_sort(F.collect_set(F.when(is_v & ~F.col("is_deny"), F.col("size")))).alias(f"group_sizes_{v}"))
         aggs.append(F.max(F.when(is_v, F.col("is_deny").cast("int"))).alias(f"any_denylisted_{v}"))
     return unioned.groupBy("node_id").agg(*aggs)
 
 
+node_key_sizes = [
+    node_key_sizes_fn(via_label, key_col, spark=spark, write_path=f"{COMMON_PATH}/node_key_sizes_{via_label}")
+    for via_label, key_col in VIA_KEY_COLS
+]
 node_via_groups = stage_sliced(
-    node_via_groups_fn, spark=spark, write_path=f"{COMMON_PATH}/node_via_groups", n_slices=_N
+    node_via_groups_fn, node_key_sizes, spark=spark, write_path=f"{COMMON_PATH}/node_via_groups", n_slices=_N
 )
 
 # COMMAND ----------

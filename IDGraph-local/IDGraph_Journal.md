@@ -737,6 +737,7 @@ identical in IDGraph4), `{GRAPH_ROOT}/cc_output/result`,
 `IDGraph5/edge_labels/node_labels`. Config `MAX_FANOUT` is a per-source dict
 matching the scored build. Outputs by dependency:
 - `s3://data-science-research/ravi/IDGraph_common/component_quality/` --
+  `node_key_sizes_{via}` (distinct node, group size, denylisted) and
   `node_via_groups` (one row per node: per source, sorted non-denylisted group
   sizes + deny flag). Depends only on filtered_base + DENYLIST: reused by every
   graph. (Was three per-source tables `node_via_groups_{via}` before 2026-11-05.)
@@ -892,3 +893,17 @@ outputs). Still open: replace `filtered_base x fanout` by a count over key if
 `n_distinct` == filtered_base rows per key (check on Databricks first); broadcast
 hints for matched_nodes / component_summary if the Spark UI shows sort-merge
 joins with a small side.
+
+**2026-11-09 common step split in two.** Runs: FetchFailed twice at the merged
+common step (lost executors on 8 x xlarge; moved workers to on-demand, shuffle
+retry confs, elastic disk), then a sliced run of it was killed after 4+ hours --
+each slice re-read and re-shuffled the full `fanout` (~1B keys per source for
+id5/tapad); only `base` was cut to 1/N. Now: `node_key_sizes_{via}` (per source,
+unsliced: filtered_base x fanout -> distinct node_id, size, is_deny), then
+`node_via_groups` (union of those narrow tables, group by node; sliced only if
+SLICE_HEAVY_STEPS, and slices re-read only the narrow tables). Count-per-key
+instead of the fanout join was rejected: equivalent by construction (fanout =
+countDistinct(node_id) per key over the same non-null base rows that
+filtered_base dedups), but a window over the denylisted tapad key (millions of
+nodes) can't be split by AQE, whereas the skew join can. Identical outputs on
+synthetic data, sliced and unsliced.
