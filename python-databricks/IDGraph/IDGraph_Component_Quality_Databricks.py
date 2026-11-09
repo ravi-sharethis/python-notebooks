@@ -119,6 +119,9 @@ _N = N_SLICES if SLICE_HEAVY_STEPS else 1
 
 TYPE_SHORT = {"HEM_MD5": "HEM", "HARDWARE_IDFA": "IDFA", "HARDWARE_ANDROID_AD_ID": "AAID"}
 MAID_TYPES = ["HARDWARE_IDFA", "HARDWARE_ANDROID_AD_ID"]
+# Short type names that get their own count column (n_type_<T>) and has/hasn't
+# breakdown. Any other type still shows up in type_set and n_other.
+ID_TYPES = ["HEM", "IDFA", "AAID", "TTD", "ID5_UID", "ST"]
 
 _inputs = [RESULT_PATH, NODE_LABELS_PATH] + [
     f"{SOURCE_BUILD_PATH}/{v}_{t}" for v in VIA_LABELS for t in ("fanout", "filtered_base")
@@ -345,6 +348,7 @@ def component_tokens_fn(nodes_df, slice_id=0, n_slices=1, spark=None, write_path
 
 @stage_dataframe(write_format="parquet")
 def component_structure_fn(tokens_df, slice_id=0, n_slices=1, spark=None, write_path=None):
+    tshort = F.substring_index("token", ":", -1)  # token = "<sources>:<short type>"
     per_via = [F.max(f"max_group_size_{v}").alias(f"max_group_size_{v}") for v in VIA_LABELS]
     s = (
         tokens_df.filter(in_slice("component", slice_id, n_slices))
@@ -355,6 +359,8 @@ def component_structure_fn(tokens_df, slice_id=0, n_slices=1, spark=None, write_
             F.sum(F.when(F.col("type_group") == "MAID", F.col("n_nodes")).otherwise(0)).alias("n_maid"),
             F.sum(F.when(F.col("type_group") == "OTHER", F.col("n_nodes")).otherwise(0)).alias("n_other"),
             F.sum(F.when(F.col("unlinked"), F.col("n_nodes")).otherwise(0)).alias("n_unlinked"),
+            *[F.sum(F.when(tshort == t, F.col("n_nodes")).otherwise(0)).alias(f"n_type_{t}") for t in ID_TYPES],
+            _sorted_join(F.collect_set(tshort)).alias("type_set"),
             *per_via,
         )
     )
@@ -484,6 +490,8 @@ def component_summary_fn(structure_df, singletons_df, matches_df, slice_id=0, n_
         (group == "OTHER").cast("long").alias("n_other"),
         F.lit("singleton").alias("sources"),
         _type_short("type").alias("singleton_type"),
+        _type_short("type").alias("type_set"),
+        *[(_type_short("type") == t).cast("long").alias(f"n_type_{t}") for t in ID_TYPES],
         "raw_source_set",
         "singleton_reasons",
         "min_dropped_size",
@@ -534,6 +542,11 @@ component_summary = stage_sliced(
 # MAGIC - `pct_over_merged_judgeable` = class 2 / judgeable (only where class 2 was possible)
 # MAGIC - `pct_incomplete` = incomplete / (class 1 + class 2)
 # MAGIC - `pct_ids_over_merged` = nodes in class-2 components / nodes in class 1 + 2 components
+# MAGIC
+# MAGIC `type_set` = the ID types present in a component (e.g. `AAID+HEM+TTD`), like
+# MAGIC `sources` for ID types. `breakdown_has_type_size` compares components with vs
+# MAGIC without each type in `ID_TYPES`, size bucket by size bucket -- e.g. whether
+# MAGIC components containing TTD over-merge more than those of the same size without.
 
 # COMMAND ----------
 
@@ -559,6 +572,8 @@ BREAKDOWNS = {
     "by_id_types": ["id_types"],
     "by_sources_size": ["sources", "size_bucket"],
     "by_sources_id_types": ["sources", "id_types"],
+    "by_type_set": ["type_set"],
+    "by_type_set_size": ["type_set", "size_bucket"],
 }
 
 
@@ -581,6 +596,17 @@ def singleton_breakdown_fn(summary_df, spark=None, write_path=None):
 
 
 @stage_dataframe(write_format="parquet")
+def has_type_breakdown_fn(summary_df, spark=None, write_path=None):
+    # Components with vs without each ID type, by size -- one row per component
+    # and type after the explode, so a single pass covers every type.
+    per_type = F.explode(F.array(*[
+        F.struct(F.lit(t).alias("id_type"), (F.col(f"n_type_{t}") > 0).alias("has_type")) for t in ID_TYPES
+    ]))
+    s = summary_df.withColumn("_t", per_type).select("*", "_t.id_type", "_t.has_type").drop("_t")
+    return _breakdown(s, ["id_type", "has_type", "size_bucket"])
+
+
+@stage_dataframe(write_format="parquet")
 def person_split_summary_fn(person_df, spark=None, write_path=None):
     # Only people with 2+ of their nodes in our graph can be split.
     return (
@@ -596,6 +622,9 @@ breakdowns = {
     name: breakdown_fn(component_summary, cols, spark=spark, write_path=f"{SPLIT_PATH}/breakdown_{name}")
     for name, cols in BREAKDOWNS.items()
 }
+has_type_breakdown = has_type_breakdown_fn(
+    component_summary, spark=spark, write_path=f"{SPLIT_PATH}/breakdown_has_type_size"
+)
 singleton_breakdown = singleton_breakdown_fn(
     component_summary, spark=spark, write_path=f"{SPLIT_PATH}/breakdown_singletons"
 )
@@ -630,6 +659,7 @@ _SHOW = [
 
 breakdowns_pd = {name: _add_rates(df.toPandas()) for name, df in breakdowns.items()}
 singleton_pd = _add_rates(singleton_breakdown.toPandas())
+has_type_pd = _add_rates(has_type_breakdown.toPandas())
 
 _size_pd = breakdowns_pd["by_size"]
 _tot = _add_rates(_size_pd[[c for c in _size_pd.columns if c.startswith(("n_", "ids_"))]].sum().to_frame().T)
@@ -652,11 +682,18 @@ _SORT = {
     "by_id_types": ["id_types"],
     "by_sources_size": ["sources", "size_order"],
     "by_sources_id_types": ["sources", "id_types"],
+    "by_type_set": ["type_set"],
+    "by_type_set_size": ["type_set", "size_order"],
 }
 for name, cols in BREAKDOWNS.items():
     print(f"=== [{SCORE_SPLIT}] {name} ===")
     print(breakdowns_pd[name].sort_values(_SORT[name])[cols + _SHOW].to_string(index=False))
     print()
+
+_h_cols = ["id_type", "size_bucket", "has_type"]
+print(f"=== [{SCORE_SPLIT}] with vs without each ID type, by size ===")
+print(has_type_pd.sort_values(["id_type", "size_order", "has_type"])[_h_cols + _SHOW].to_string(index=False))
+print()
 
 print(f"=== [{SCORE_SPLIT}] singletons by type x source x reason x smallest dropped group ===")
 _s_cols = ["singleton_type", "raw_source_set", "singleton_reasons", "dropped_size_bucket"]
@@ -674,5 +711,7 @@ print(
 for name, cols in BREAKDOWNS.items():
     print(f"# {name}")
     print(breakdowns_pd[name].sort_values(_SORT[name]).drop(columns="size_order").to_csv(index=False))
+print("# has_type_size")
+print(has_type_pd.sort_values(["id_type", "size_order", "has_type"]).drop(columns="size_order").to_csv(index=False))
 print("# singletons")
 print(singleton_pd.sort_values(_s_cols).drop(columns="size_order").to_csv(index=False))

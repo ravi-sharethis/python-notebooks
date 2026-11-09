@@ -907,3 +907,14 @@ countDistinct(node_id) per key over the same non-null base rows that
 filtered_base dedups), but a window over the denylisted tapad key (millions of
 nodes) can't be split by AQE, whereas the skew join can. Identical outputs on
 synthetic data, sliced and unsliced.
+
+**2026-11-09 per-ID-type visibility in A.** TTD/ID5_UID/ST were only visible as
+"neither/other" in A's tables (B sees them through tokens). Added per component
+`n_type_{T}` for ID_TYPES = HEM, IDFA, AAID, TTD, ID5_UID, ST and `type_set`
+(sorted types present, like `sources`); new breakdowns `by_type_set`,
+`by_type_set_size`, and `breakdown_has_type_size` (with vs without each type, by
+size -- one explode pass). TTD itself never matches Affinity: its effect is
+learned only from components that also hold matched HEM/MAID nodes; TTD-only
+components and TTD singletons are always class 0 (prediction only), and the
+with/without comparison is associative, not causal. No extra shuffle;
+existing outputs unchanged on synthetic data.
