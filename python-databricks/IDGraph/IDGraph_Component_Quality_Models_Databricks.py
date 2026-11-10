@@ -83,7 +83,10 @@ from pyspark.ml.functions import vector_to_array
 
 # Must be a graph notebook A has already scored on both splits.
 GRAPH_ROOT = "s3://data-science-research/ravi/IDGraph5"
-QUALITY_ROOT = f"{GRAPH_ROOT}/component_quality"
+# Must match the SAMPLE_PCT notebook A ran with (a job-level parameter sets both).
+dbutils.widgets.text("SAMPLE_PCT", "100")
+SAMPLE_PCT = int(dbutils.widgets.get("SAMPLE_PCT"))
+QUALITY_ROOT = f"{GRAPH_ROOT}/component_quality" + ("" if SAMPLE_PCT >= 100 else f"_sample{SAMPLE_PCT}")
 GRAPH_PATH = f"{QUALITY_ROOT}/graph"
 TRAIN_SPLIT_PATH = f"{QUALITY_ROOT}/tune"
 EVAL_SPLIT_PATH = f"{QUALITY_ROOT}/holdout"

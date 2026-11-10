@@ -29,6 +29,9 @@
 # MAGIC - `GRAPH_PATH` -- this graph's caps and components; shared by tune and holdout.
 # MAGIC - `SPLIT_PATH` -- this graph x SCORE_SPLIT. Only AFS people in that split
 # MAGIC   count as matches (others are treated as unmatched).
+# MAGIC - `OUT_GRAPH_PATH` / `OUT_SPLIT_PATH` -- the per-component outputs. Same as
+# MAGIC   GRAPH_PATH / SPLIT_PATH unless SAMPLE_PCT < 100, then under
+# MAGIC   `component_quality_sample<pct>/`.
 
 # COMMAND ----------
 
@@ -92,6 +95,18 @@ COMMON_PATH = "s3://data-science-research/ravi/IDGraph_common/component_quality"
 GRAPH_PATH = f"{GRAPH_ROOT}/component_quality/graph"
 SPLIT_PATH = f"{GRAPH_ROOT}/component_quality/{SCORE_SPLIT}"
 
+# Percent of components analysed (by hash of the component id), e.g. 5 for a
+# quick end-to-end test. A widget, so one job-level parameter sets it for every
+# task (A tune, A holdout, B). The common tables, node_sources and the Affinity
+# matching (matched_nodes .. component_matches) always cover all nodes: they're
+# shared with the full run, and `incomplete` needs all of a person's components.
+# Everything per component is sampled and written under OUT_*_PATH.
+dbutils.widgets.text("SAMPLE_PCT", "100")
+SAMPLE_PCT = int(dbutils.widgets.get("SAMPLE_PCT"))
+_SAMPLE_ROOT = f"{GRAPH_ROOT}/component_quality" + ("" if SAMPLE_PCT >= 100 else f"_sample{SAMPLE_PCT}")
+OUT_GRAPH_PATH = f"{_SAMPLE_ROOT}/graph"
+OUT_SPLIT_PATH = f"{_SAMPLE_ROOT}/{SCORE_SPLIT}"
+
 VIA_KEY_COLS = [
     ("id5", "individual_id5"),
     ("liid", "liid"),
@@ -128,7 +143,7 @@ _inputs = [RESULT_PATH, NODE_LABELS_PATH] + [
 ]
 _missing = [p for p in _inputs if not _path_exists(p)]
 assert not _missing, f"missing inputs: {_missing}"
-print(f"scoring {GRAPH_ROOT} (MAX_FANOUT={MAX_FANOUT}) on the {SCORE_SPLIT} split")
+print(f"scoring {GRAPH_ROOT} (MAX_FANOUT={MAX_FANOUT}) on the {SCORE_SPLIT} split, {SAMPLE_PCT}% of components")
 
 # COMMAND ----------
 
@@ -155,6 +170,13 @@ def _type_group(type_col):
         .when(F.col(type_col).isin(MAID_TYPES), F.lit("MAID"))
         .otherwise(F.lit("OTHER"))
     )
+
+
+def _in_sample(col_name):
+    # Salted so the sample doesn't line up with in_slice's hash of the same column.
+    if SAMPLE_PCT >= 100:
+        return F.lit(True)
+    return F.pmod(F.xxhash64(F.lit("sample"), F.col(col_name)), F.lit(100)) < F.lit(SAMPLE_PCT)
 
 
 def _sorted_join(arr):
@@ -321,7 +343,7 @@ result = spark.read.format("delta").load(RESULT_PATH)
 def nodes_fn(result_df, node_sources_df, slice_id=0, n_slices=1, spark=None, write_path=None):
     return (
         result_df.select(F.col("id").alias("node_id"), "component", "component_size")
-        .filter(in_slice("node_id", slice_id, n_slices))
+        .filter(in_slice("node_id", slice_id, n_slices) & _in_sample("component"))
         .join(node_sources_df.filter(in_slice("node_id", slice_id, n_slices)), on="node_id", how="left")
         .withColumn("type", _node_type())
     )
@@ -390,14 +412,14 @@ def singletons_fn(nodes_df, spark=None, write_path=None):
     )
 
 
-nodes = stage_sliced(nodes_fn, result, node_sources, spark=spark, write_path=f"{GRAPH_PATH}/nodes", n_slices=_N)
+nodes = stage_sliced(nodes_fn, result, node_sources, spark=spark, write_path=f"{OUT_GRAPH_PATH}/nodes", n_slices=_N)
 component_tokens = stage_sliced(
-    component_tokens_fn, nodes, spark=spark, write_path=f"{GRAPH_PATH}/component_tokens", n_slices=_N
+    component_tokens_fn, nodes, spark=spark, write_path=f"{OUT_GRAPH_PATH}/component_tokens", n_slices=_N
 )
 component_structure = stage_sliced(
-    component_structure_fn, component_tokens, spark=spark, write_path=f"{GRAPH_PATH}/component_structure", n_slices=_N
+    component_structure_fn, component_tokens, spark=spark, write_path=f"{OUT_GRAPH_PATH}/component_structure", n_slices=_N
 )
-singletons = singletons_fn(nodes, spark=spark, write_path=f"{GRAPH_PATH}/singletons")
+singletons = singletons_fn(nodes, spark=spark, write_path=f"{OUT_GRAPH_PATH}/singletons")
 
 _n_unlinked = component_structure.filter(F.col("n_unlinked") > 0).count()
 _n_bad_singletons = singletons.filter(F.col("source_set").isNotNull() | (F.col("raw_source_set") == "none")).count()
@@ -531,7 +553,7 @@ component_summary = stage_sliced(
     singletons,
     component_matches,
     spark=spark,
-    write_path=f"{SPLIT_PATH}/component_summary",
+    write_path=f"{OUT_SPLIT_PATH}/component_summary",
     n_slices=_N,
 )
 
@@ -643,20 +665,20 @@ def person_split_summary_fn(person_df, spark=None, write_path=None):
 
 
 breakdowns = {
-    name: breakdown_fn(component_summary, cols, spark=spark, write_path=f"{SPLIT_PATH}/breakdown_{name}")
+    name: breakdown_fn(component_summary, cols, spark=spark, write_path=f"{OUT_SPLIT_PATH}/breakdown_{name}")
     for name, cols in BREAKDOWNS.items()
 }
 source_group_breakdown = source_group_breakdown_fn(
-    component_summary, spark=spark, write_path=f"{SPLIT_PATH}/breakdown_source_group_size"
+    component_summary, spark=spark, write_path=f"{OUT_SPLIT_PATH}/breakdown_source_group_size"
 )
 has_type_breakdown = has_type_breakdown_fn(
-    component_summary, spark=spark, write_path=f"{SPLIT_PATH}/breakdown_has_type_size"
+    component_summary, spark=spark, write_path=f"{OUT_SPLIT_PATH}/breakdown_has_type_size"
 )
 singleton_breakdown = singleton_breakdown_fn(
-    component_summary, spark=spark, write_path=f"{SPLIT_PATH}/breakdown_singletons"
+    component_summary, spark=spark, write_path=f"{OUT_SPLIT_PATH}/breakdown_singletons"
 )
 person_split_summary = person_split_summary_fn(
-    person_spread, spark=spark, write_path=f"{SPLIT_PATH}/person_split_summary"
+    person_spread, spark=spark, write_path=f"{OUT_SPLIT_PATH}/person_split_summary"
 )
 
 # COMMAND ----------
@@ -699,7 +721,7 @@ source_group_pd = _add_rates(
 _size_pd = breakdowns_pd["by_size"]
 _tot = _add_rates(_size_pd[[c for c in _size_pd.columns if c.startswith(("n_", "ids_"))]].sum().to_frame().T)
 _people = person_split_summary.toPandas().iloc[0]
-print(f"=== [{SCORE_SPLIT}] headline: {GRAPH_ROOT} ===")
+print(f"=== [{SCORE_SPLIT}] headline: {GRAPH_ROOT}, {SAMPLE_PCT}% of components ===")
 print(f"components:                {int(_tot['n_components'].iloc[0]):,}")
 print(f"% over-merged (components): {_tot['pct_over_merged'].iloc[0]}  (judgeable only: {_tot['pct_over_merged_judgeable'].iloc[0]})")
 print(f"% over-merged (IDs):        {_tot['pct_ids_over_merged'].iloc[0]}")

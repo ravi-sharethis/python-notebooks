@@ -924,3 +924,14 @@ Also added `breakdown_source_group_size`: non-singletons by each linking source'
 printed version collapsed over size -- the per-source cap question straight from
 observed labels. The `_size` fields are per node (largest in-cap group that
 linked it / smallest dropped group), maxed per component -- not per node type.
+
+**2026-11-09 SAMPLE_PCT switch (A and B).** Widget, default 100; one job-level
+parameter sets it for all three tasks. Keeps components with
+pmod(xxhash64("sample", component), 100) < SAMPLE_PCT (salted so it doesn't
+align with in_slice). Not sampled (shared with the full run): common tables,
+node_sources, and matched_nodes..component_matches (`incomplete` needs all of a
+person's components -- sampling them would undercount it). Sampled outputs
+(nodes, tokens, structure, singletons, component_summary, breakdowns, B models)
+go to `{GRAPH_ROOT}/component_quality_sample<pct>/`. The common step still runs
+in full on the first run (cheap to reuse; sampling it needs a full shuffle anyway).
+100% identical to before; 30% sample ran end to end on synthetic data.
