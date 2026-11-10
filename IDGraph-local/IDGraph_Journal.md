@@ -978,3 +978,7 @@ in full on the first run (cheap to reuse; sampling it needs a full shuffle anywa
 - TTD / ID5_UID / ST don't raise over-merge at fixed size; they grow components.
 - Notebook A now prints only the key tables. by_type_set, by_type_set_size and the
   singleton breakdown stay on S3.
+- Correction: tapad's group-size effect is clear only for 5-8-node components and
+  absent from 17 nodes up. Sources look similar at a fixed size on the judgeable
+  base. Size is the signal, so prefer rules that limit component growth (the giant
+  split) over a tapad cap alone. Report: `reports/idgraph5_component_quality_report.html`.

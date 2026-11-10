@@ -134,3 +134,12 @@ into the giant), not by making a given component worse.
 **B LR coefficients (over_merged):** log2_size +0.69 and share_hem +0.67 are the
 largest; source shares are negative relative to the baseline. Consistent with
 "size plus HEM-MAID joins". The models add little; the A tables carry the signal.
+
+**Correction (2026-11-10, while writing the report):** the tapad group-size effect is
+weaker than stated above. It is clear only in 5-8-node components (30.9 -> 46.4).
+At 9-16 nodes it's U-shaped (52.4 at group 3, 42.9 at 5-6, 57.2 at 13-16). From 17
+nodes up, no source shows a group-size effect. So a tapad cap of about 8 is worth
+testing, but expect a modest gain; component size is the strong signal. Also, on the
+judgeable base the sources are similar at a fixed size (about 48-54% at 9-16 nodes).
+The earlier "liid cleanest" reading was detection bias.
+Full report: `IDGraph-local/reports/idgraph5_component_quality_report.html`.
