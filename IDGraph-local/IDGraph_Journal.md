@@ -918,3 +918,9 @@ learned only from components that also hold matched HEM/MAID nodes; TTD-only
 components and TTD singletons are always class 0 (prediction only), and the
 with/without comparison is associative, not causal. No extra shuffle;
 existing outputs unchanged on synthetic data.
+
+Also added `breakdown_source_group_size`: non-singletons by each linking source's
+`max_group_size_{via}` bucket (GROUP_SIZE_BOUNDS 2..128) x component size, plus a
+printed version collapsed over size -- the per-source cap question straight from
+observed labels. The `_size` fields are per node (largest in-cap group that
+linked it / smallest dropped group), maxed per component -- not per node type.

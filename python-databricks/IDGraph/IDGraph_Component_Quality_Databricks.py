@@ -174,6 +174,7 @@ def _size_bucket(col, bounds):
 
 
 COMPONENT_SIZE_BOUNDS = [1, 2, 4, 8, 16, 32, 64, 128, 1_000, 10_000, 100_000]
+GROUP_SIZE_BOUNDS = [2, 3, 4, 6, 8, 12, 16, 24, 32, 64, 128]
 DROPPED_SIZE_BOUNDS = [min(MAX_FANOUT.values()) + 1, 24, 32, 48, 64, 128, 256, 1024]
 
 # COMMAND ----------
@@ -547,13 +548,17 @@ component_summary = stage_sliced(
 # MAGIC `sources` for ID types. `breakdown_has_type_size` compares components with vs
 # MAGIC without each type in `ID_TYPES`, size bucket by size bucket -- e.g. whether
 # MAGIC components containing TTD over-merge more than those of the same size without.
+# MAGIC `breakdown_source_group_size`: non-singletons by each linking source's largest
+# MAGIC group (`max_group_size_{via}` bucket) x component size -- the cap question:
+# MAGIC at which group size does each source start over-merging?
 
 # COMMAND ----------
 
 
-def _breakdown(df, cols):
+def _breakdown(df, cols, *extra_aggs):
     matched = F.col("class") > 0
     return df.groupBy(*cols).agg(
+        *extra_aggs,
         F.count("*").alias("n_components"),
         F.sum((F.col("class") == 0).cast("long")).alias("n_class0"),
         F.sum((F.col("class") == 1).cast("long")).alias("n_class1"),
@@ -607,6 +612,25 @@ def has_type_breakdown_fn(summary_df, spark=None, write_path=None):
 
 
 @stage_dataframe(write_format="parquet")
+def source_group_breakdown_fn(summary_df, spark=None, write_path=None):
+    # Non-singletons by each source's largest linking group: one row per
+    # component and source that linked it. Kept by component size too, so a
+    # big-group effect can be told apart from a big-component one.
+    per_src = F.explode(F.array(*[
+        F.struct(F.lit(v).alias("source"), F.col(f"max_group_size_{v}").alias("max_group_size")) for v in VIA_LABELS
+    ]))
+    s = (
+        summary_df.filter(F.col("sources") != "singleton")
+        .withColumn("_s", per_src)
+        .select("*", "_s.source", "_s.max_group_size")
+        .drop("_s")
+        .filter(F.col("max_group_size").isNotNull())
+        .withColumn("max_group_bucket", _size_bucket("max_group_size", GROUP_SIZE_BOUNDS))
+    )
+    return _breakdown(s, ["source", "max_group_bucket", "size_bucket"], F.min("max_group_size").alias("group_order"))
+
+
+@stage_dataframe(write_format="parquet")
 def person_split_summary_fn(person_df, spark=None, write_path=None):
     # Only people with 2+ of their nodes in our graph can be split.
     return (
@@ -622,6 +646,9 @@ breakdowns = {
     name: breakdown_fn(component_summary, cols, spark=spark, write_path=f"{SPLIT_PATH}/breakdown_{name}")
     for name, cols in BREAKDOWNS.items()
 }
+source_group_breakdown = source_group_breakdown_fn(
+    component_summary, spark=spark, write_path=f"{SPLIT_PATH}/breakdown_source_group_size"
+)
 has_type_breakdown = has_type_breakdown_fn(
     component_summary, spark=spark, write_path=f"{SPLIT_PATH}/breakdown_has_type_size"
 )
@@ -660,6 +687,14 @@ _SHOW = [
 breakdowns_pd = {name: _add_rates(df.toPandas()) for name, df in breakdowns.items()}
 singleton_pd = _add_rates(singleton_breakdown.toPandas())
 has_type_pd = _add_rates(has_type_breakdown.toPandas())
+source_group_size_pd = _add_rates(source_group_breakdown.toPandas())
+# Collapsed over component size (counts add up, so rates are recomputed).
+_g = source_group_breakdown.toPandas().drop(columns=["size_bucket", "size_order"])
+source_group_pd = _add_rates(
+    _g.groupby(["source", "max_group_bucket"], as_index=False).agg(
+        {c: ("min" if c == "group_order" else "sum") for c in _g.columns if c not in ("source", "max_group_bucket")}
+    )
+)
 
 _size_pd = breakdowns_pd["by_size"]
 _tot = _add_rates(_size_pd[[c for c in _size_pd.columns if c.startswith(("n_", "ids_"))]].sum().to_frame().T)
@@ -690,6 +725,11 @@ for name, cols in BREAKDOWNS.items():
     print(breakdowns_pd[name].sort_values(_SORT[name])[cols + _SHOW].to_string(index=False))
     print()
 
+_g_cols = ["source", "max_group_bucket"]
+print(f"=== [{SCORE_SPLIT}] components by each source's largest linking group (MAX_FANOUT={MAX_FANOUT}) ===")
+print(source_group_pd.sort_values(["source", "group_order"])[_g_cols + _SHOW].to_string(index=False))
+print()
+
 _h_cols = ["id_type", "size_bucket", "has_type"]
 print(f"=== [{SCORE_SPLIT}] with vs without each ID type, by size ===")
 print(has_type_pd.sort_values(["id_type", "size_order", "has_type"])[_h_cols + _SHOW].to_string(index=False))
@@ -711,6 +751,13 @@ print(
 for name, cols in BREAKDOWNS.items():
     print(f"# {name}")
     print(breakdowns_pd[name].sort_values(_SORT[name]).drop(columns="size_order").to_csv(index=False))
+print("# source_group")
+print(source_group_pd.sort_values(["source", "group_order"]).drop(columns="group_order").to_csv(index=False))
+print("# source_group_size")
+print(
+    source_group_size_pd.sort_values(["source", "group_order", "size_order"])
+    .drop(columns=["group_order", "size_order"]).to_csv(index=False)
+)
 print("# has_type_size")
 print(has_type_pd.sort_values(["id_type", "size_order", "has_type"]).drop(columns="size_order").to_csv(index=False))
 print("# singletons")
