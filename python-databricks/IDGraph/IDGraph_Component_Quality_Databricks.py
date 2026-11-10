@@ -737,7 +737,6 @@ _SHOW = [
 GIANT_MIN_SIZE = 100_001
 
 breakdowns_pd = {name: _add_rates(df.toPandas()) for name, df in breakdowns.items()}
-singleton_pd = _add_rates(singleton_breakdown.toPandas())
 has_type_pd = _add_rates(has_type_breakdown.toPandas())
 source_group_size_pd = _add_rates(source_group_breakdown.toPandas())
 # Collapsed over component size (counts add up, so rates are recomputed).
@@ -784,7 +783,12 @@ _SORT = {
     "by_type_set": ["type_set"],
     "by_type_set_size": ["type_set", "size_order"],
 }
+# Long tables (one row per type set / singleton reason) stay on S3 only --
+# printed, they push the key tables past Databricks' output limit.
+_LONG = ["by_type_set", "by_type_set_size"]
 for name, cols in BREAKDOWNS.items():
+    if name in _LONG:
+        continue
     print(f"=== [{SCORE_SPLIT}] {name} ===")
     print(breakdowns_pd[name].sort_values(_SORT[name])[cols + _SHOW].to_string(index=False))
     print()
@@ -799,12 +803,9 @@ print(f"=== [{SCORE_SPLIT}] with vs without each ID type, by size ===")
 print(has_type_pd.sort_values(["id_type", "size_order", "has_type"])[_h_cols + _SHOW].to_string(index=False))
 print()
 
-print(f"=== [{SCORE_SPLIT}] singletons by type x source x reason x smallest dropped group ===")
-_s_cols = ["singleton_type", "raw_source_set", "singleton_reasons", "dropped_size_bucket"]
-print(
-    singleton_pd.sort_values(_s_cols)[_s_cols + ["n_components", "pct_class0", "pct_class1", "pct_class2", "pct_incomplete"]]
-    .to_string(index=False)
-)
+print(f"not printed (read from S3): " + ", ".join(
+    [f"{OUT_SPLIT_PATH}/breakdown_{n}" for n in _LONG] + [f"{OUT_SPLIT_PATH}/breakdown_singletons"]
+))
 
 # COMMAND ----------
 
@@ -813,10 +814,10 @@ print(
 # COMMAND ----------
 
 for name, cols in BREAKDOWNS.items():
+    if name in _LONG:
+        continue
     print(f"# {name}")
     print(breakdowns_pd[name].sort_values(_SORT[name]).drop(columns="size_order").to_csv(index=False))
-print("# source_group")
-print(source_group_pd.sort_values(["source", "group_order"]).drop(columns="group_order").to_csv(index=False))
 print("# source_group_size")
 print(
     source_group_size_pd.sort_values(["source", "group_order", "size_order"])
@@ -824,5 +825,3 @@ print(
 )
 print("# has_type_size")
 print(has_type_pd.sort_values(["id_type", "size_order", "has_type"]).drop(columns="size_order").to_csv(index=False))
-print("# singletons")
-print(singleton_pd.sort_values(_s_cols).drop(columns="size_order").to_csv(index=False))

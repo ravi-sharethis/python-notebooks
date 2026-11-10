@@ -62,3 +62,75 @@ calibrated below 0.8 (it predicts 0.48-0.66 where the actual rate is 0.93-1.0).
 6. **Most singletons are cap casualties.** source_group shows most singletons are
    nodes whose groups were dropped at sizes 17-128 (tapad, liid). Dropped HEM
    singletons are about 84% incomplete: the person has nodes elsewhere.
+
+---
+# Rerun 2026-11-10: single-person-node labels (commit 2092656), 15% sample
+
+## A: tune, by_size
+| size | class1 | class2 | %over-merged | %over-merged (judgeable) | %incomplete | %multi-AFS nodes |
+|---|---|---|---|---|---|---|
+| 1 | 5,647,716 | 0 | 0 | - | 83.4 | 44.3 |
+| 2 | 97,234 | 3,116 | 3.1 | 30.0 | 70.2 | 35.0 |
+| 3-4 | 301,022 | 21,528 | 6.7 | 35.2 | 71.2 | 34.6 |
+| 5-8 | 624,795 | 79,206 | 11.3 | 43.5 | 73.4 | 35.7 |
+| 9-16 | 816,652 | 145,093 | 15.1 | 52.6 | 76.1 | 38.2 |
+| 17-32 | 349,575 | 77,874 | 18.2 | 58.4 | 76.1 | 39.1 |
+| 33-64 | 133,073 | 60,329 | 31.2 | 73.5 | 78.8 | 40.2 |
+| 65-128 | 26,246 | 30,119 | 53.4 | 87.9 | 84.1 | 41.2 |
+| 129-1000 | 2,310 | 8,603 | 78.8 | 95.8 | 92.2 | 42.1 |
+| giant | 0 | 1 | 100 | 100 | 100 | 41.5 |
+
+- Totals: 5.1% of matched components over-merged (15.3% of multi-node ones,
+  54.0% of judgeable ones). IDs over-merged excluding the giant: 23.1%
+  (11.16M / 48.25M).
+- id_types: HEM only 0.56%, MAID only 0.12%, HEM+MAID 16.7%. Over-merging happens
+  where HEM and MAID are joined.
+- Same size, different sources (9-16): liid 6.5%, id5+liid+tapad 11.5%,
+  id5+tapad 12.3%, liid+tapad 14.2%, tapad 16.9%. At size 2: tapad 3.1%, liid 0%.
+- About 35-44% of matched nodes map to 2+ AFS people at every size. That is a
+  property of the Affinity crosswalk.
+
+## B: holdout
+- over_merged (judgeable, all multi-node): n 276,387, base 0.345. LR AUC 0.670
+  overall; by stratum 0.516 (2-4), 0.581 (5-16), 0.666 (17-128), 0.648 (129+).
+  All models over-predict by 0.1-0.2. This is the expected tune (70% of people)
+  vs holdout (30%) gap in visible over-merges: tune judgeable rate 54% vs holdout 34.5%.
+- incomplete: LR AUC 0.662 overall, 0.569 on 2+, 0.691 on singletons. Lookup and
+  LR are well calibrated; nb_sum is not.
+- Conclusion: little lift beyond size. The descriptive tables are the useful output.
+
+## Rerun: source x group size, has-type, holdout (2026-11-10)
+CSVs: `idgraph5_cq15_tune_source_group_size.csv`, `idgraph5_cq15_tune_has_type_size.csv`.
+
+**Split-size correction checks out.** Tune and holdout over-merge rates differ only
+because a split holds 70% vs 30% of people. If two nodes belong to different people,
+both are visible with probability s^2; if they are the same person, with probability s.
+So observed odds = true odds x s. Correcting:
+- size-2 judgeable: tune 30.0% -> 38.0%, holdout 15.8% -> 38.4%
+- all judgeable: tune 54.0% -> 62.7%, holdout 34.5% -> 63.7%
+
+So about 38% of 2-node components whose two nodes each match one person hold two
+different AFS people. That is likely household-level linking (devices and emails
+shared in a home), not random error.
+
+**Largest-group size vs over-merge, at the same component size (judgeable base):**
+- tapad: rises with group size. 5-8 components: 30.9 (group 3), 34.3 (4),
+  40.9 (5-6), 46.4 (7-8). 9-16 components: 42.9 (5-6), 44.9 (7-8), 51.3 (9-12),
+  57.2 (13-16).
+- liid: flat. 9-16 components: 49.9 / 50.1 / 50.3 / 48.5 / 51.6 / 53.6 / 52.1.
+- id5: flat, slightly falling. 9-16 components: 50.3 -> 44.8.
+- So a tighter cap is justified for tapad only (around 6-8). liid and id5 at 16
+  show no per-group penalty.
+
+**Presence of TTD / ID5_UID / ST at the same size (judgeable base):** no consistent
+effect. Slightly lower below 17 nodes, slightly higher at 33-64, where the
+comparison group is tiny. These types matter by growing components (they bridge
+into the giant), not by making a given component worse.
+- HEM-free multi-node components are mostly MAID-only; few are judgeable.
+
+**Holdout headline:** 2.56% over-merged (judgeable 34.49%); IDs excluding the giant
+13.09%; people split 90.87% (6.22M of 6.85M); multi-AFS nodes 41.6%.
+
+**B LR coefficients (over_merged):** log2_size +0.69 and share_hem +0.67 are the
+largest; source shares are negative relative to the baseline. Consistent with
+"size plus HEM-MAID joins". The models add little; the A tables carry the signal.

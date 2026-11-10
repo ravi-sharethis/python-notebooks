@@ -966,3 +966,15 @@ in full on the first run (cheap to reuse; sampling it needs a full shuffle anywa
 - Synthetic check: with no multi-person nodes, A's output is identical and B's
   lookup/LR are identical (only NB moves). With 30% multi-person nodes injected,
   the runs complete and there are no over-merged singletons.
+
+## 2026-11-10 (later): what the corrected labels say
+- After the split correction (observed odds = true odds x split share), tune and
+  holdout agree: about 38% of judgeable 2-node components and 63% of all judgeable
+  components hold 2+ AFS people. A lot of this is probably household linking, so
+  the target needs a decision: person-level or household-level identity?
+- tapad is the only source whose over-merge rate rises with its largest group
+  size at fixed component size, so the cap evidence is for tapad at about 6-8.
+  liid and id5 are flat up to 16.
+- TTD / ID5_UID / ST don't raise over-merge at fixed size; they grow components.
+- Notebook A now prints only the key tables. by_type_set, by_type_set_size and the
+  singleton breakdown stay on S3.
