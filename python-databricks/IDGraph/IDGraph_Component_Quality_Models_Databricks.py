@@ -340,8 +340,10 @@ def _with_lookup(df, rates_df):
 # COMMAND ----------
 
 # MAGIC %md ## Model 2 -- Bayesian naive Bayes token rates
-# MAGIC Per token: `n` = nodes carrying it in labelled training components,
-# MAGIC `n_pos` = those in positive components. Rates are shrunk toward the
+# MAGIC Per token: `n` = labelled training components carrying it, `n_pos` =
+# MAGIC those that are positive. Counted per component, not per node: node counts
+# MAGIC let the one giant component (697M nodes on IDGraph5) set every token's
+# MAGIC rate to ~0.99. Rates are shrunk toward the
 # MAGIC token's ID-type rate with PRIOR_STRENGTH pseudo-observations. Small table
 # MAGIC (one row per token) -- the shrinkage runs in pandas.
 
@@ -355,7 +357,7 @@ def nb_token_counts_fn(all_tokens_df, labels_df, slice_id=0, n_slices=1, spark=N
         all_tokens_df.filter(this_slice)
         .join(labels_df.filter(this_slice), on="component")
         .groupBy("token")
-        .agg(F.sum("n_nodes").alias("n"), F.sum(F.col("n_nodes") * F.col("label")).alias("n_pos"))
+        .agg(F.count("*").alias("n"), F.sum("label").alias("n_pos"))
     )
 
 
@@ -589,12 +591,15 @@ def _auc(h):
 def _metrics(hist_pd):
     all_strata = hist_pd.groupby(["model", "bin"], as_index=False)[["n", "n_pos", "sum_p"]].sum()
     all_strata["stratum"] = "all"
-    h = pd.concat([hist_pd, all_strata], ignore_index=True)
-    auc = h.groupby(["stratum", "model"]).apply(_auc).unstack("model")[MODEL_NAMES]
+    # "2+" = everything but singletons, whose labels are easy and can carry "all".
+    multi = hist_pd[hist_pd["stratum"] != "1"].groupby(["model", "bin"], as_index=False)[["n", "n_pos", "sum_p"]].sum()
+    multi["stratum"] = "2+"
+    h = pd.concat([hist_pd, all_strata, multi], ignore_index=True)
+    auc = h.groupby(["stratum", "model"]).apply(_auc, include_groups=False).unstack("model")[MODEL_NAMES]
     counts = h[h["model"] == MODEL_NAMES[0]].groupby("stratum")[["n", "n_pos"]].sum()
     auc.insert(0, "base_rate", (counts["n_pos"] / counts["n"]).round(4))
     auc.insert(0, "n_eval", counts["n"])
-    order = ["all"] + [s for s in ["1", "2-4", "5-16", "17-128", "129+"] if s in auc.index]
+    order = [s for s in ["all", "2+", "1", "2-4", "5-16", "17-128", "129+"] if s in auc.index]
     auc = auc.reindex(order)
     calib = all_strata.assign(band=(all_strata["bin"] * 10 // N_SCORE_BINS))
     calib = calib.groupby(["model", "band"])[["n", "n_pos", "sum_p"]].sum()

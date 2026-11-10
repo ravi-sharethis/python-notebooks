@@ -935,3 +935,34 @@ person's components -- sampling them would undercount it). Sampled outputs
 go to `{GRAPH_ROOT}/component_quality_sample<pct>/`. The common step still runs
 in full on the first run (cheap to reuse; sampling it needs a full shuffle anyway).
 100% identical to before; 30% sample ran end to end on synthetic data.
+
+## 2026-11-09: first component-quality run on IDGraph5 (15% sample)
+- The full job ran end to end with SAMPLE_PCT=15. Tables and findings are in
+  `results/idgraph5_component_quality_sample15_2026-11-09.md`.
+- Main issue: class 2 is mostly label noise. 44% of matched singletons are a single
+  node that maps to 2+ AFS persons (59% of MAID singletons).
+- The giant component (697M nodes) holds 91% of matched-component IDs and dominates
+  the node-weighted NB token rates.
+- B's overall over_merged AUC of 0.88 is inflated by judgeable singletons, which are
+  all positive. Within size strata, AUC is 0.47-0.74.
+- Next: (a) count only single-person nodes when computing n_afs, and report
+  multi-person nodes separately; (b) weight NB counts by component, or exclude the
+  giant; (c) report B's AUC excluding singletons and the giant.
+
+## 2026-11-10: label and model fixes after the 15% run
+- **A, labels:** only single-person nodes (one AFS id) count toward the class,
+  `incomplete` and `person_spread`. Nodes mapping to 2+ AFS people are counted
+  (`n_multi_afs`, `pct_multi_afs_nodes`) but ignored as labels.
+  - `judgeable` = 2+ single-person nodes, so singletons can no longer be class 2.
+  - Components matched only through multi-person nodes are class 0
+    (`n_multi_afs_only`).
+  - The new tables are `*_single_afs` under SPLIT_PATH. The old component_afs /
+    person_spread / component_matches folders can be deleted.
+- **A, headline:** adds % over-merged (IDs) excluding giant components
+  (>= GIANT_MIN_SIZE = 100,001) and the share of multi-person matched nodes.
+- **B, NB:** token counts are per component (each labelled component counts once
+  per token), no longer per node. The giant can't swamp token rates any more.
+- **B, AUC:** adds a "2+" row (all non-singletons).
+- Synthetic check: with no multi-person nodes, A's output is identical and B's
+  lookup/LR are identical (only NB moves). With 30% multi-person nodes injected,
+  the runs complete and there are no over-merged singletons.

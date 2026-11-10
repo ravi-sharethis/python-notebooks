@@ -13,14 +13,20 @@
 # MAGIC
 # MAGIC | class | meaning |
 # MAGIC |---|---|
-# MAGIC | 0 | none of the component's nodes match Affinity |
-# MAGIC | 1 | matched nodes map to exactly one `AFS_INDIVIDUAL_ID` |
-# MAGIC | 2 | matched nodes map to more than one `AFS_INDIVIDUAL_ID` |
+# MAGIC | 0 | no node in the component maps to exactly one `AFS_INDIVIDUAL_ID` |
+# MAGIC | 1 | its single-person nodes all map to the same `AFS_INDIVIDUAL_ID` |
+# MAGIC | 2 | its single-person nodes map to more than one `AFS_INDIVIDUAL_ID` |
+# MAGIC
+# MAGIC Only single-person nodes (matching exactly one AFS individual) are labels.
+# MAGIC A node Affinity maps to 2+ people (a shared device, a household email) says
+# MAGIC nothing about what the graph merged -- on IDGraph5 they were 44% of matched
+# MAGIC singletons, all class 2 under the old rule. They're counted
+# MAGIC (`n_multi_afs`) but don't set the class, `incomplete` or `person_spread`.
 # MAGIC
 # MAGIC Observed labels per component (from Affinity, not predictions):
 # MAGIC `over_merged` (class 2), `incomplete` (an AFS person in it also has nodes in
 # MAGIC another component) -- both null for class 0. `judgeable` = class 2 was
-# MAGIC possible (>= 2 matched nodes, or one node mapping to 2+ AFS individuals).
+# MAGIC possible (>= 2 single-person nodes).
 # MAGIC Predicted probabilities for every component come from notebook B.
 # MAGIC
 # MAGIC Outputs live in three places, by what they depend on:
@@ -454,8 +460,10 @@ def matched_nodes_fn(result_df, labels_df, slice_id=0, n_slices=1, spark=None, w
 
 @stage_dataframe(write_format="parquet")
 def component_afs_fn(matched_df, spark=None, write_path=None):
+    # Single-person nodes only -- see the class table at the top.
     return (
-        matched_df.select("component", F.explode("afs_ids").alias("afs_id"))
+        matched_df.filter(F.size("afs_ids") == 1)
+        .select("component", F.col("afs_ids")[0].alias("afs_id"))
         .groupBy("component", "afs_id")
         .agg(F.count("*").alias("n_nodes"))
     )
@@ -470,7 +478,12 @@ def person_spread_fn(component_afs_df, spark=None, write_path=None):
 
 @stage_dataframe(write_format="parquet")
 def component_matches_fn(matched_df, component_afs_df, person_df, spark=None, write_path=None):
-    n_matched = matched_df.groupBy("component").agg(F.count("*").alias("n_matched"))
+    multi = (F.size("afs_ids") >= 2).cast("long")
+    n_matched = matched_df.groupBy("component").agg(
+        F.count("*").alias("n_matched"),
+        F.sum(multi).alias("n_multi_afs"),
+        F.sum(1 - multi).alias("n_single_afs"),
+    )
     per_comp = (
         component_afs_df.join(person_df.select("afs_id", "n_components"), on="afs_id")
         .groupBy("component")
@@ -479,16 +492,21 @@ def component_matches_fn(matched_df, component_afs_df, person_df, spark=None, wr
             F.max((F.col("n_components") >= 2).cast("int")).alias("incomplete"),
         )
     )
-    return n_matched.join(per_comp, on="component")
+    # Left: components whose matches are all multi-person nodes keep their counts.
+    return n_matched.join(per_comp, on="component", how="left")
 
 
 matched_nodes = stage_sliced(
     matched_nodes_fn, result, node_labels, spark=spark, write_path=f"{SPLIT_PATH}/matched_nodes", n_slices=_N
 )
-component_afs = component_afs_fn(matched_nodes, spark=spark, write_path=f"{SPLIT_PATH}/component_afs")
-person_spread = person_spread_fn(component_afs, spark=spark, write_path=f"{SPLIT_PATH}/person_spread")
+# "_single_afs" = built from single-person nodes only (2026-11-10). The older
+# component_afs / person_spread / component_matches folders counted every node
+# and can be deleted.
+component_afs = component_afs_fn(matched_nodes, spark=spark, write_path=f"{SPLIT_PATH}/component_afs_single_afs")
+person_spread = person_spread_fn(component_afs, spark=spark, write_path=f"{SPLIT_PATH}/person_spread_single_afs")
 component_matches = component_matches_fn(
-    matched_nodes, component_afs, person_spread, spark=spark, write_path=f"{SPLIT_PATH}/component_matches"
+    matched_nodes, component_afs, person_spread,
+    spark=spark, write_path=f"{SPLIT_PATH}/component_matches_single_afs",
 )
 
 # COMMAND ----------
@@ -524,7 +542,7 @@ def component_summary_fn(structure_df, singletons_df, matches_df, slice_id=0, n_
     s = (
         multi.unionByName(single, allowMissingColumns=True)
         .join(matches_df.filter(this_slice), on="component", how="left")
-        .fillna({"n_matched": 0, "n_afs": 0, "incomplete": 0})
+        .fillna({"n_matched": 0, "n_multi_afs": 0, "n_single_afs": 0, "n_afs": 0, "incomplete": 0})
     )
     cls = F.when(F.col("n_afs") == 0, 0).when(F.col("n_afs") == 1, 1).otherwise(2)
     id_types = (
@@ -540,7 +558,7 @@ def component_summary_fn(structure_df, singletons_df, matches_df, slice_id=0, n_
         s.withColumn("class", cls)
         .withColumn("over_merged", F.when(matched, F.col("class") == 2))
         .withColumn("incomplete", F.when(matched, F.col("incomplete") == 1))
-        .withColumn("judgeable", (F.col("n_matched") >= 2) | (F.col("n_afs") >= 2))
+        .withColumn("judgeable", F.col("n_single_afs") >= 2)
         .withColumn("id_types", id_types)
         .withColumn("size_bucket", _size_bucket("component_size", COMPONENT_SIZE_BOUNDS))
         .withColumn("size_order", F.col("component_size"))
@@ -565,6 +583,9 @@ component_summary = stage_sliced(
 # MAGIC - `pct_over_merged_judgeable` = class 2 / judgeable (only where class 2 was possible)
 # MAGIC - `pct_incomplete` = incomplete / (class 1 + class 2)
 # MAGIC - `pct_ids_over_merged` = nodes in class-2 components / nodes in class 1 + 2 components
+# MAGIC - `pct_multi_afs_nodes` = matched nodes Affinity maps to 2+ people / all matched nodes
+# MAGIC   (ignored for labels); `n_multi_afs_only` = components matched only through such nodes
+# MAGIC   (class 0)
 # MAGIC
 # MAGIC `type_set` = the ID types present in a component (e.g. `AAID+HEM+TTD`), like
 # MAGIC `sources` for ID types. `breakdown_has_type_size` compares components with vs
@@ -589,6 +610,9 @@ def _breakdown(df, cols, *extra_aggs):
         F.sum(F.col("incomplete").cast("long")).alias("n_incomplete"),
         F.sum(F.when(matched, F.col("component_size")).otherwise(0)).alias("ids_matched_components"),
         F.sum(F.when(F.col("over_merged"), F.col("component_size")).otherwise(0)).alias("ids_over_merged"),
+        F.sum("n_matched").alias("nodes_matched"),
+        F.sum("n_multi_afs").alias("nodes_multi_afs"),
+        F.sum(((F.col("n_matched") > 0) & (F.col("class") == 0)).cast("long")).alias("n_multi_afs_only"),
         F.min("size_order").alias("size_order"),
     )
 
@@ -698,13 +722,19 @@ def _add_rates(pdf):
     pdf["pct_incomplete"] = (100 * pdf["n_incomplete"] / matched.where(matched > 0)).round(2)
     ids = pdf["ids_matched_components"]
     pdf["pct_ids_over_merged"] = (100 * pdf["ids_over_merged"] / ids.where(ids > 0)).round(2)
+    nodes = pdf["nodes_matched"]
+    pdf["pct_multi_afs_nodes"] = (100 * pdf["nodes_multi_afs"] / nodes.where(nodes > 0)).round(2)
     return pdf
 
 
 _SHOW = [
     "n_components", "pct_class0", "pct_class1", "pct_class2",
     "pct_over_merged", "pct_over_merged_judgeable", "pct_incomplete", "pct_ids_over_merged",
+    "pct_multi_afs_nodes",
 ]
+# Components at least this big count as "giant" in the headline -- IDGraph5 has
+# one (697M nodes) and it dominates any node-weighted rate.
+GIANT_MIN_SIZE = 100_001
 
 breakdowns_pd = {name: _add_rates(df.toPandas()) for name, df in breakdowns.items()}
 singleton_pd = _add_rates(singleton_breakdown.toPandas())
@@ -719,13 +749,25 @@ source_group_pd = _add_rates(
 )
 
 _size_pd = breakdowns_pd["by_size"]
-_tot = _add_rates(_size_pd[[c for c in _size_pd.columns if c.startswith(("n_", "ids_"))]].sum().to_frame().T)
+_count_cols = [c for c in _size_pd.columns if c.startswith(("n_", "ids_", "nodes_"))]
+_tot = _add_rates(_size_pd[_count_cols].sum().to_frame().T)
+_is_giant = _size_pd["size_order"] >= GIANT_MIN_SIZE
+_giant = _size_pd[_is_giant][_count_cols].sum()
+_tot_ng = _add_rates(_size_pd[~_is_giant][_count_cols].sum().to_frame().T)
 _people = person_split_summary.toPandas().iloc[0]
 print(f"=== [{SCORE_SPLIT}] headline: {GRAPH_ROOT}, {SAMPLE_PCT}% of components ===")
 print(f"components:                {int(_tot['n_components'].iloc[0]):,}")
 print(f"% over-merged (components): {_tot['pct_over_merged'].iloc[0]}  (judgeable only: {_tot['pct_over_merged_judgeable'].iloc[0]})")
 print(f"% over-merged (IDs):        {_tot['pct_ids_over_merged'].iloc[0]}")
+print(
+    f"  excl. {int(_giant['n_components']):,} giant (>= {GIANT_MIN_SIZE:,} IDs, "
+    f"{int(_giant['ids_matched_components']):,} IDs): {_tot_ng['pct_ids_over_merged'].iloc[0]}"
+)
 print(f"% incomplete (components):  {_tot['pct_incomplete'].iloc[0]}")
+print(
+    f"% matched nodes -> 2+ people: {_tot['pct_multi_afs_nodes'].iloc[0]}  (not used as labels; "
+    f"{int(_tot['n_multi_afs_only'].iloc[0]):,} components matched only through them -> class 0)"
+)
 _split_pct = 100 * _people["n_people_split"] / max(_people["n_people_splittable"], 1)
 print(
     f"% people split:             {_split_pct:.2f}  "
