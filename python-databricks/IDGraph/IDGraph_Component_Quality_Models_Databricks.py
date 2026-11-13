@@ -3,8 +3,8 @@
 # MAGIC # ID Graph — component quality models (notebook B)
 # MAGIC
 # MAGIC Predicts, for EVERY component (including the class-0 ones Affinity can't
-# MAGIC judge), the probability that it is over-merged and the probability that it
-# MAGIC is incomplete -- from the component's own constituents, never from
+# MAGIC judge), the probability that it is over-merged, incomplete, or healthy
+# MAGIC (judgeable, neither) -- from the component's own constituents, never from
 # MAGIC Affinity. Affinity only provides the training labels (tune split) and the
 # MAGIC test labels (holdout split), both from notebook A
 # MAGIC (`IDGraph_Component_Quality_Databricks.py`). Design: `IDGraph_Journal.md` §14.
@@ -14,10 +14,10 @@
 # MAGIC
 # MAGIC | model | idea |
 # MAGIC |---|---|
-# MAGIC | `lookup` | baseline: rate of the component's cell (sources x ID types x size x singleton reason), falling back to coarser cells |
+# MAGIC | `lookup` | baseline: rate of the component's cell (sources x type set x size x singleton reason), falling back to coarser cells |
 # MAGIC | `nb_sum` | Bayesian naive Bayes: sum of token log-odds (classic NB -- big components saturate), calibrated with size |
 # MAGIC | `nb_mean` | same token rates, but node-weighted MEAN token log-odds + size -- doesn't saturate |
-# MAGIC | `lr` | logistic regression on size, source shares, ID-type shares, group sizes, singleton reasons |
+# MAGIC | `lr` | logistic regression on size, node counts (type, source x type) and multi-source pair counts (type pair, source) -- see the glossary |
 # MAGIC
 # MAGIC Token rates: `(own positives + PRIOR_STRENGTH x type rate) / (own total +
 # MAGIC PRIOR_STRENGTH)`, type rate = pooled rate of every token with that ID type
@@ -74,6 +74,8 @@ from staging_df import _path_exists, in_slice, stage_dataframe, stage_sliced
 
 # COMMAND ----------
 
+import itertools
+
 import numpy as np
 import pandas as pd
 from pyspark.ml import Pipeline, PipelineModel
@@ -90,20 +92,44 @@ QUALITY_ROOT = f"{GRAPH_ROOT}/component_quality" + ("" if SAMPLE_PCT >= 100 else
 GRAPH_PATH = f"{QUALITY_ROOT}/graph"
 TRAIN_SPLIT_PATH = f"{QUALITY_ROOT}/tune"
 EVAL_SPLIT_PATH = f"{QUALITY_ROOT}/holdout"
-MODELS_PATH = f"{QUALITY_ROOT}/models"
+# v2: node + multi-source pair count features, healthy target.
+MODELS_PATH = f"{QUALITY_ROOT}/models_v2"
+# filtered_base/fanout, for the pair features.
+SOURCE_BUILD_PATH = f"{GRAPH_ROOT}/build_output"
 
-VIA_LABELS = ["id5", "liid", "tapad"]
-TARGETS = ["over_merged", "incomplete"]
+VIA_KEY_COLS = [
+    ("id5", "individual_id5"),
+    ("liid", "liid"),
+    ("tapad", "individual_id_tapad"),
+]
+VIA_LABELS = [v for v, _ in VIA_KEY_COLS]
+TARGETS = ["over_merged", "incomplete", "healthy"]
+
+# Must match notebook A.
+MAX_FANOUT = {"id5": 16, "liid": 16, "tapad": 16}
+DENYLIST = {
+    "tapad": {
+        "No8xjSC1%2BF8tmUR6x2oK%2BwN5kOn4r6EQMogME9KNx4Ef6i2iPbTIaEY8POYimlBf",
+    },
+}
+TYPE_SHORT = {"HEM_MD5": "HEM", "HARDWARE_IDFA": "IDFA", "HARDWARE_ANDROID_AD_ID": "AAID"}
+ID_TYPES = ["HEM", "IDFA", "AAID", "TTD", "ID5_UID", "ST"]
+# Pair features skip components this big (the giant); its pair features are 0.
+GIANT_MIN_SIZE = 100_001
+
+# Every (sorted) type pair, one pair feature each.
+TYPE_PAIRS = [f"{a}-{b}" for a, b in itertools.combinations_with_replacement(sorted(ID_TYPES), 2)]
 
 # A component with one matched ID can never be class 2; training on those
-# would teach "less Affinity data = good". Applies to train AND test rows.
+# would teach "less Affinity data = good". Applies to train AND test rows, for
+# over_merged and healthy.
 OVERMERGE_TRAIN_JUDGEABLE_ONLY = True
 
 # Lookup cells with fewer labelled components fall back to the next coarser level.
 LOOKUP_MIN_CELL = 100
 LOOKUP_LEVELS = [
-    ["sources", "id_types", "size_bucket", "reason_key"],
-    ["sources", "id_types", "size_bucket"],
+    ["sources", "type_set", "size_bucket", "reason_key"],
+    ["sources", "type_set", "size_bucket"],
     ["sources", "size_bucket"],
     ["size_bucket"],
 ]
@@ -134,9 +160,11 @@ DROPPED_SIZE_BOUNDS = [16, 24, 32, 48, 64, 128, 256, 1024]
 
 _inputs = [
     f"{GRAPH_PATH}/component_tokens",
+    f"{GRAPH_PATH}/nodes",
     f"{TRAIN_SPLIT_PATH}/component_summary",
     f"{EVAL_SPLIT_PATH}/component_summary",
 ]
+_inputs += [f"{SOURCE_BUILD_PATH}/{v}_{t}" for v in VIA_LABELS for t in ("fanout", "filtered_base")]
 _missing = [p for p in _inputs if not _path_exists(p)]
 assert not _missing, f"missing inputs (run notebook A on both splits first): {_missing}"
 
@@ -162,6 +190,19 @@ STRATA_BOUNDS = [1, 4, 16, 128]  # -> "1", "2-4", "5-16", "17-128", "129+"
 _LOG2 = lambda c: F.log2(F.lit(1.0) + F.coalesce(c, F.lit(0)).cast("double"))
 
 
+_type_short_map = F.create_map(*[F.lit(x) for kv in TYPE_SHORT.items() for x in kv])
+
+
+def _short_type(col):
+    # node_id is "<type>:<value>".
+    t = F.substring_index(F.col(col), ":", 1)
+    return F.coalesce(_type_short_map[t], t)
+
+
+def _col_name(prefix, value):
+    return prefix + value.replace("+", "_").replace("-", "_")
+
+
 def _logit(p):
     return F.log(p / (F.lit(1.0) - p))
 
@@ -185,72 +226,167 @@ def _p1(prob_col="probability"):
 
 # COMMAND ----------
 
-# MAGIC %md ## Features (one row per component) and labels
-# MAGIC Features come from the graph only (tune `component_summary` minus its label
-# MAGIC columns, plus source shares from `component_tokens`); labels come from the
-# MAGIC tune (training) and holdout (test) summaries.
+# MAGIC %md ## Multi-source pairs per component (graph only)
+# MAGIC A pair = two nodes of one component that share a key of size 2..MAX_FANOUT in
+# MAGIC a source. Only pairs that 2+ sources link are kept (e.g. liid and tapad both
+# MAGIC put the same two nodes in a group) -- single-source pairs are the graph's
+# MAGIC ordinary links. Only nodes linked by 2+ sources can be in such a pair, so
+# MAGIC each source's pairs are built from those nodes only. No Affinity.
 
 # COMMAND ----------
 
-LR_FEATURES = (
-    ["log2_size", "is_singleton", "share_hem", "share_maid", "share_other", "has_hem_and_maid", "denylisted"]
-    + [f"share_{v}" for v in VIA_LABELS]
-    + [f"has_group_{v}" for v in VIA_LABELS]
-    + [f"log2_max_group_{v}" for v in VIA_LABELS]
-    + [f"log2_dropped_{v}" for v in VIA_LABELS]
-    + [f"alone_{v}" for v in VIA_LABELS]
-)
+
+@stage_dataframe(write_format="parquet")
+def pair_members_fn(nodes_df, via_label, key_col, spark=None, write_path=None):
+    base = spark.read.parquet(f"{SOURCE_BUILD_PATH}/{via_label}_filtered_base").select("node_id", key_col)
+    deny = list(DENYLIST.get(via_label, set()))
+    if deny:
+        base = base.filter(~F.col(key_col).isin(deny))
+    keys = (
+        spark.read.parquet(f"{SOURCE_BUILD_PATH}/{via_label}_fanout")
+        .filter((F.col("n_distinct") >= 2) & (F.col("n_distinct") <= MAX_FANOUT[via_label]))
+        .select(key_col)
+    )
+    multi_source = nodes_df.filter(
+        F.col("source_set").contains("+")
+        & F.col("source_set").contains(via_label)
+        & (F.col("component_size") < GIANT_MIN_SIZE)
+    ).select("node_id", "component")
+    return (
+        base.join(multi_source, on="node_id")
+        .join(keys, on=key_col, how="leftsemi")
+        .select(F.col(key_col).cast("string").alias("key"), "node_id", "component")
+    )
 
 
 @stage_dataframe(write_format="parquet")
-def features_fn(summary_df, tokens_df, slice_id=0, n_slices=1, spark=None, write_path=None):
+def source_pairs_fn(members_df, spark=None, write_path=None):
+    a = members_df.select("key", F.col("node_id").alias("node_a"), "component")
+    b = members_df.select("key", F.col("node_id").alias("node_b"))
+    return a.join(b, on="key").filter(F.col("node_a") < F.col("node_b")).select("node_a", "node_b", "component").distinct()
+
+
+@stage_dataframe(write_format="parquet")
+def pair_features_fn(parts, spark=None, write_path=None):
+    unioned = None
+    for p, v in zip(parts, VIA_LABELS):
+        p = p.withColumn("via_type", F.lit(v))
+        unioned = p if unioned is None else unioned.unionByName(p)
+    pairs = (
+        unioned.groupBy("node_a", "node_b", "component")
+        .agg(F.array_sort(F.collect_set("via_type")).alias("sources"))
+        .filter(F.size("sources") >= 2)
+        .withColumn("type_pair", F.concat_ws("-", F.array_sort(F.array(_short_type("node_a"), _short_type("node_b")))))
+    )
+    return pairs.groupBy("component").agg(
+        *[F.sum((F.col("type_pair") == tp).cast("long")).alias(_col_name("pair_", tp)) for tp in TYPE_PAIRS],
+        *[F.sum(F.array_contains("sources", v).cast("long")).alias(f"pair_{v}") for v in VIA_LABELS],
+        # Not a feature: >1 means pair_<type> and pair_<source> no longer say
+        # which pair had which sources (the caveat in the glossary).
+        F.countDistinct(F.concat_ws("+", "sources")).alias("n_pair_source_sets"),
+    )
+
+
+# Notebook A may have written nodes in slices -- drop the partition column.
+nodes = spark.read.parquet(f"{GRAPH_PATH}/nodes").drop("slice")
+_pair_parts = []
+for _via, _key_col in VIA_KEY_COLS:
+    _members = pair_members_fn(nodes, _via, _key_col, spark=spark, write_path=f"{MODELS_PATH}/pair_members_{_via}")
+    _pair_parts.append(source_pairs_fn(_members, spark=spark, write_path=f"{MODELS_PATH}/pairs_{_via}"))
+pair_features = pair_features_fn(_pair_parts, spark=spark, write_path=f"{MODELS_PATH}/pair_features")
+
+_pf = pair_features.agg(
+    F.count("*").alias("n"), F.sum((F.col("n_pair_source_sets") > 1).cast("long")).alias("n_mixed")
+).first()
+print(
+    f"components with a multi-source pair: {_pf['n']:,}; with pairs from 2+ different source sets "
+    f"(the glossary caveat): {_pf['n_mixed']:,} ({100 * _pf['n_mixed'] / max(_pf['n'], 1):.2f}%)"
+)
+
+# COMMAND ----------
+
+# MAGIC %md ## Features (one row per component) and labels
+# MAGIC Features come from the graph only; labels come from the tune (training) and
+# MAGIC holdout (test) summaries. ID type = the node id's type prefix, for every
+# MAGIC node, matched or not. Types: HEM, IDFA, AAID, TTD, ID5_UID, ST. Sources:
+# MAGIC id5, liid, tapad.
+# MAGIC
+# MAGIC **Glossary** (all counts per component; the model sees log2(1 + count))
+# MAGIC
+# MAGIC | feature | meaning |
+# MAGIC |---|---|
+# MAGIC | `log2_size` | log2 of the number of nodes |
+# MAGIC | `node_<T>` | nodes of type T, e.g. `node_HEM` |
+# MAGIC | `node_<source>_<T>` | nodes of type T that the source links (the node shares a kept key with another node in that source), e.g. `node_tapad_IDFA`. A node linked by two sources counts under both |
+# MAGIC | `pair_<A>_<B>` | multi-source pairs (two nodes that 2+ sources link) joining types A and B, e.g. `pair_HEM_IDFA` |
+# MAGIC | `pair_<source>` | multi-source pairs that the source links, e.g. `pair_liid` |
+# MAGIC
+# MAGIC Example: one HEM-IDFA pair linked by liid and tapad gives `pair_HEM_IDFA` = 1,
+# MAGIC `pair_liid` = 1, `pair_tapad` = 1.
+# MAGIC
+# MAGIC **Caveat:** with two multi-source pairs from different source sets (say
+# MAGIC HEM-IDFA by liid+tapad, AAID-IDFA by id5+tapad), the counts don't say which
+# MAGIC pair had which sources. The pair cell above prints how often that happens.
+# MAGIC
+# MAGIC Other columns kept for the lookup and NB models only (not LR features):
+# MAGIC `sources`, `type_set`, `size_bucket`, singleton reason and dropped size.
+
+# COMMAND ----------
+
+NODE_FEATURES = [f"node_{t}" for t in ID_TYPES] + [f"node_{v}_{t}" for v in VIA_LABELS for t in ID_TYPES]
+PAIR_FEATURES = [_col_name("pair_", tp) for tp in TYPE_PAIRS] + [f"pair_{v}" for v in VIA_LABELS]
+COUNT_FEATURES = NODE_FEATURES + PAIR_FEATURES
+LR_FEATURES = ["log2_size"] + [f"log2_{c}" for c in COUNT_FEATURES]
+
+
+@stage_dataframe(write_format="parquet")
+def features_fn(summary_df, tokens_df, pairs_df, slice_id=0, n_slices=1, spark=None, write_path=None):
     this_slice = in_slice("component", slice_id, n_slices)
+    # token = "<source_set>:<type>", one row per (component, token) with its node count.
     src = F.split(F.substring_index("token", ":", 1), "\\+")
-    src_counts = tokens_df.filter(this_slice).groupBy("component").agg(
-        *[F.sum(F.when(F.array_contains(src, v), F.col("n_nodes")).otherwise(0)).alias(f"n_src_{v}") for v in VIA_LABELS]
+    typ = F.substring_index("token", ":", -1)
+    node_src = tokens_df.filter(this_slice).groupBy("component").agg(
+        *[
+            F.sum(F.when(F.array_contains(src, v) & (typ == t), F.col("n_nodes")).otherwise(0)).alias(f"node_{v}_{t}")
+            for v in VIA_LABELS
+            for t in ID_TYPES
+        ]
     )
     keep = (
-        ["component", "component_size", "n_hem", "n_maid", "n_other", "sources", "id_types", "size_bucket"]
+        ["component", "component_size", "sources", "type_set", "size_bucket"]
         + ["singleton_type", "singleton_reasons", "min_dropped_size"]
-        + [f"max_group_size_{v}" for v in VIA_LABELS]
-        + [f"dropped_size_{v}" for v in VIA_LABELS]
+        + [F.col(f"n_type_{t}").alias(f"node_{t}") for t in ID_TYPES]
     )
-    f = summary_df.filter(this_slice).select(*keep).join(src_counts, on="component", how="left")
-    size = F.col("component_size").cast("double")
-    reasons = F.coalesce(F.col("singleton_reasons"), F.lit(""))
+    f = (
+        summary_df.filter(this_slice)
+        .select(*keep)
+        .join(node_src, on="component", how="left")
+        .join(pairs_df.filter(this_slice).drop("n_pair_source_sets"), on="component", how="left")
+        .fillna(0, subset=COUNT_FEATURES)
+    )
     dropped_bucket = F.when(F.col("min_dropped_size").isNull(), F.lit("-")).otherwise(
         _size_bucket("min_dropped_size", DROPPED_SIZE_BOUNDS)
     )
     f = (
         f.withColumn("is_singleton", (F.col("sources") == "singleton").cast("double"))
-        .withColumn("log2_size", F.log2(size))
-        .withColumn("share_hem", F.col("n_hem") / size)
-        .withColumn("share_maid", F.col("n_maid") / size)
-        .withColumn("share_other", F.col("n_other") / size)
-        .withColumn("has_hem_and_maid", ((F.col("n_hem") > 0) & (F.col("n_maid") > 0)).cast("double"))
-        .withColumn("denylisted", reasons.contains("denylisted").cast("double"))
+        .withColumn("log2_size", F.log2(F.col("component_size").cast("double")))
         .withColumn("dropped_bucket", dropped_bucket)
         .withColumn("reason_key", F.concat_ws("|", F.coalesce(F.col("singleton_reasons"), F.lit("-")), dropped_bucket))
         .withColumn("stratum", _size_bucket("component_size", STRATA_BOUNDS))
     )
-    for v in VIA_LABELS:
-        f = (
-            f.withColumn(f"share_{v}", F.coalesce(F.col(f"n_src_{v}"), F.lit(0)) / size)
-            .withColumn(f"has_group_{v}", F.col(f"max_group_size_{v}").isNotNull().cast("double"))
-            .withColumn(f"log2_max_group_{v}", _LOG2(F.col(f"max_group_size_{v}")))
-            .withColumn(f"log2_dropped_{v}", _LOG2(F.col(f"dropped_size_{v}")))
-            .withColumn(f"alone_{v}", reasons.contains(f"{v}:alone").cast("double"))
-            .drop(f"n_src_{v}")
-        )
+    for c in COUNT_FEATURES:
+        f = f.withColumn(f"log2_{c}", _LOG2(F.col(c)))
     return f
 
 
 @stage_dataframe(write_format="parquet")
 def labels_fn(summary_df, target, spark=None, write_path=None):
+    # healthy = judgeable and neither over-merged nor incomplete.
     rows = summary_df.filter(F.col("class") > 0)
-    if target == "over_merged" and OVERMERGE_TRAIN_JUDGEABLE_ONLY:
+    if target in ("over_merged", "healthy") and OVERMERGE_TRAIN_JUDGEABLE_ONLY:
         rows = rows.filter(F.col("judgeable"))
-    return rows.select("component", F.col(target).cast("double").alias("label"))
+    label = ~F.col("over_merged") & ~F.col("incomplete") if target == "healthy" else F.col(target)
+    return rows.select("component", label.cast("double").alias("label"))
 
 
 # Notebook A may have written these in slices -- drop the partition column.
@@ -259,7 +395,7 @@ train_summary = spark.read.parquet(f"{TRAIN_SPLIT_PATH}/component_summary").drop
 eval_summary = spark.read.parquet(f"{EVAL_SPLIT_PATH}/component_summary").drop("slice")
 
 features = stage_sliced(
-    features_fn, train_summary, component_tokens, spark=spark, write_path=f"{MODELS_PATH}/features", n_slices=_N
+    features_fn, train_summary, component_tokens, pair_features, spark=spark, write_path=f"{MODELS_PATH}/features", n_slices=_N
 )
 train_labels = {
     t: labels_fn(train_summary, t, spark=spark, write_path=f"{MODELS_PATH}/labels_tune_{t}") for t in TARGETS

@@ -899,23 +899,24 @@ print(_th.sort_values(["token", "size_bucket"]).to_csv(index=False))
 
 # COMMAND ----------
 
-# MAGIC %md ## Pairs: which sources + type pairs link the same person
-# MAGIC A pair = two single-person matched nodes (this split, sampled components)
-# MAGIC that share a key of size 2..MAX_FANOUT in at least one source -- a direct
-# MAGIC link in this graph. `sources` = every source with such a key for the pair
-# MAGIC (e.g. `liid+tapad` = both sources linked these two nodes). Counted per
+# MAGIC %md ## Pairs: which sources + type pairs make healthy components
+# MAGIC A pair = two nodes of a judgeable sampled component that share a key of size
+# MAGIC 2..MAX_FANOUT in at least one source -- a direct link in this graph, taken
+# MAGIC from the graph alone (all nodes, matched or not). `sources` = every source
+# MAGIC with such a key for the pair (e.g. `liid+tapad` = both sources linked these
+# MAGIC two nodes). Affinity enters only through the component's label. Counted per
 # MAGIC component, like the token table: `n_judgeable` = components holding at least
-# MAGIC one such pair (always judgeable: a pair is 2 single-person nodes), and the
-# MAGIC rates and lifts are over those components, against all judgeable components
-# MAGIC of the same size. Pair-level extra: `n_pairs`, and `pct_same_person` = pairs
-# MAGIC Affinity says are one person (is the link itself right). A missing link
-# MAGIC (under-merge) is not a pair, so incomplete only shows up via the component.
+# MAGIC one such pair; rates and lifts are over those components, against all
+# MAGIC judgeable components of the same size. The giant component is left out (one
+# MAGIC component, billions of pairs). Pair-level extras: `n_pairs`; `n_labeled` =
+# MAGIC pairs whose two nodes each match one AFS person, and `pct_same_person` = the
+# MAGIC share of those that are the same person (is the link itself right).
 
 # COMMAND ----------
 
 
 @stage_dataframe(write_format="parquet")
-def pair_members_fn(matched_df, via_label, key_col, spark=None, write_path=None):
+def pair_members_fn(nodes_df, matched_df, summary_df, via_label, key_col, spark=None, write_path=None):
     base = spark.read.parquet(f"{SOURCE_BUILD_PATH}/{via_label}_filtered_base").select("node_id", key_col)
     deny = list(DENYLIST.get(via_label, set()))
     if deny:
@@ -925,18 +926,20 @@ def pair_members_fn(matched_df, via_label, key_col, spark=None, write_path=None)
         .filter((F.col("n_distinct") >= 2) & (F.col("n_distinct") <= MAX_FANOUT[via_label]))
         .select(key_col)
     )
-    single = matched_df.filter((F.size("afs_ids") == 1) & _in_sample("component")).select(
-        "node_id", "component", F.col("afs_ids")[0].alias("afs_id")
-    )
+    judged = summary_df.filter(F.col("judgeable") & (F.col("component_size") < GIANT_MIN_SIZE)).select("component")
+    members = nodes_df.select("node_id", "component").join(judged, on="component")
+    single = matched_df.filter(F.size("afs_ids") == 1).select("node_id", F.col("afs_ids")[0].alias("afs_id"))
     return (
-        base.join(single, on="node_id")
+        base.join(members, on="node_id")
         .join(keys, on=key_col, how="leftsemi")
+        .join(single, on="node_id", how="left")
         .select(F.col(key_col).cast("string").alias("key"), "node_id", "component", "afs_id")
     )
 
 
 @stage_dataframe(write_format="parquet")
-def source_labeled_pairs_fn(members_df, spark=None, write_path=None):
+def source_pairs_fn(members_df, spark=None, write_path=None):
+    # same_person is null unless both nodes match one AFS person.
     a = members_df.select("key", F.col("node_id").alias("node_a"), "component", F.col("afs_id").alias("afs_a"))
     b = members_df.select("key", F.col("node_id").alias("node_b"), F.col("afs_id").alias("afs_b"))
     return (
@@ -962,7 +965,9 @@ def pair_health_fn(parts, summary_df, spark=None, write_path=None):
         .withColumn("type_pair", type_pair)
     )
     per_comp = pairs.groupBy("component", "sources", "type_pair").agg(
-        F.count("*").alias("n_pairs"), F.sum(F.col("same_person").cast("long")).alias("n_same_person")
+        F.count("*").alias("n_pairs"),
+        F.count("same_person").alias("n_labeled"),
+        F.sum(F.col("same_person").cast("long")).alias("n_same_person"),
     )
     comp = summary_df.select("component", "size_bucket", "over_merged", "incomplete")
     return (
@@ -971,6 +976,7 @@ def pair_health_fn(parts, summary_df, spark=None, write_path=None):
         .agg(
             F.count("*").alias("n_judgeable"),
             F.sum("n_pairs").alias("n_pairs"),
+            F.sum("n_labeled").alias("n_labeled"),
             F.sum("n_same_person").alias("n_same_person"),
             F.sum(F.col("over_merged").cast("long")).alias("n_over_merged"),
             F.sum(F.col("incomplete").cast("long")).alias("n_incomplete"),
@@ -982,16 +988,19 @@ def pair_health_fn(parts, summary_df, spark=None, write_path=None):
 _pair_parts = []
 for _via, _key_col in VIA_KEY_COLS:
     _members = pair_members_fn(
-        matched_nodes, _via, _key_col, spark=spark, write_path=f"{OUT_SPLIT_PATH}/pair_members_{_via}"
+        nodes, matched_nodes, component_summary, _via, _key_col,
+        spark=spark, write_path=f"{OUT_SPLIT_PATH}/graph_pair_members_{_via}",
     )
-    _pair_parts.append(source_labeled_pairs_fn(_members, spark=spark, write_path=f"{OUT_SPLIT_PATH}/labeled_pairs_{_via}"))
-pair_health = pair_health_fn(_pair_parts, component_summary, spark=spark, write_path=f"{OUT_SPLIT_PATH}/pair_health")
+    _pair_parts.append(source_pairs_fn(_members, spark=spark, write_path=f"{OUT_SPLIT_PATH}/graph_pairs_{_via}"))
+pair_health = pair_health_fn(_pair_parts, component_summary, spark=spark, write_path=f"{OUT_SPLIT_PATH}/graph_pair_health")
 
 _ph = pair_health.toPandas()
 for _cols in [["sources"], ["type_pair"], ["sources", "type_pair"]]:
-    _same = _ph.groupby(_cols, as_index=False)[["n_pairs", "n_same_person"]].sum()
-    _same["pct_same_person"] = (100 * _same["n_same_person"] / _same["n_pairs"]).round(1)
-    _view = _health_view(_ph, _cols, base=size_health).merge(_same[_cols + ["n_pairs", "pct_same_person"]], on=_cols)
+    _same = _ph.groupby(_cols, as_index=False)[["n_pairs", "n_labeled", "n_same_person"]].sum()
+    _same["pct_same_person"] = (100 * _same["n_same_person"] / _same["n_labeled"]).round(1)
+    _view = _health_view(_ph, _cols, base=size_health).merge(
+        _same[_cols + ["n_pairs", "n_labeled", "pct_same_person"]], on=_cols
+    )
     print(f"=== [{SCORE_SPLIT}] components by linking pair: {' x '.join(_cols)} ===")
     print(_view.to_string(index=False))
     print()
