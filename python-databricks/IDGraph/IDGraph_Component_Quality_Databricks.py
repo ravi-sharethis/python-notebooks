@@ -101,6 +101,14 @@ COMMON_PATH = "s3://data-science-research/ravi/IDGraph_common/component_quality"
 GRAPH_PATH = f"{GRAPH_ROOT}/component_quality/graph"
 SPLIT_PATH = f"{GRAPH_ROOT}/component_quality/{SCORE_SPLIT}"
 
+# Which Affinity-matched nodes make the labels: "all" = HEM + IDFA + AAID (every
+# type Affinity matches), "hem" = HEM only. Everything from component_afs on is
+# written to its own folder ("_hem" suffix); matched_nodes and the graph tables
+# are shared. A widget, so one job can run both label sets.
+dbutils.widgets.dropdown("LABEL_SET", "all", ["all", "hem"])
+LABEL_SET = dbutils.widgets.get("LABEL_SET")
+_LABEL_SUFFIX = "" if LABEL_SET == "all" else f"_{LABEL_SET}"
+
 # Percent of components analysed (by hash of the component id), e.g. 5 for a
 # quick end-to-end test. A widget, so one job-level parameter sets it for every
 # task (A tune, A holdout, B). The common tables, node_sources and the Affinity
@@ -111,7 +119,7 @@ dbutils.widgets.text("SAMPLE_PCT", "100")
 SAMPLE_PCT = int(dbutils.widgets.get("SAMPLE_PCT"))
 _SAMPLE_ROOT = f"{GRAPH_ROOT}/component_quality" + ("" if SAMPLE_PCT >= 100 else f"_sample{SAMPLE_PCT}")
 OUT_GRAPH_PATH = f"{_SAMPLE_ROOT}/graph"
-OUT_SPLIT_PATH = f"{_SAMPLE_ROOT}/{SCORE_SPLIT}"
+OUT_SPLIT_PATH = f"{_SAMPLE_ROOT}/{SCORE_SPLIT}{_LABEL_SUFFIX}"
 
 VIA_KEY_COLS = [
     ("id5", "individual_id5"),
@@ -149,7 +157,10 @@ _inputs = [RESULT_PATH, NODE_LABELS_PATH] + [
 ]
 _missing = [p for p in _inputs if not _path_exists(p)]
 assert not _missing, f"missing inputs: {_missing}"
-print(f"scoring {GRAPH_ROOT} (MAX_FANOUT={MAX_FANOUT}) on the {SCORE_SPLIT} split, {SAMPLE_PCT}% of components")
+print(
+    f"scoring {GRAPH_ROOT} (MAX_FANOUT={MAX_FANOUT}) on the {SCORE_SPLIT} split, "
+    f"labels from {LABEL_SET} matched nodes, {SAMPLE_PCT}% of components"
+)
 
 # COMMAND ----------
 
@@ -502,11 +513,17 @@ matched_nodes = stage_sliced(
 # "_single_afs" = built from single-person nodes only (2026-11-10). The older
 # component_afs / person_spread / component_matches folders counted every node
 # and can be deleted.
-component_afs = component_afs_fn(matched_nodes, spark=spark, write_path=f"{SPLIT_PATH}/component_afs_single_afs")
-person_spread = person_spread_fn(component_afs, spark=spark, write_path=f"{SPLIT_PATH}/person_spread_single_afs")
+# The nodes whose matches make the labels (LABEL_SET).
+label_nodes = matched_nodes if LABEL_SET == "all" else matched_nodes.filter(F.col("node_id").startswith("HEM_"))
+component_afs = component_afs_fn(
+    label_nodes, spark=spark, write_path=f"{SPLIT_PATH}/component_afs_single_afs{_LABEL_SUFFIX}"
+)
+person_spread = person_spread_fn(
+    component_afs, spark=spark, write_path=f"{SPLIT_PATH}/person_spread_single_afs{_LABEL_SUFFIX}"
+)
 component_matches = component_matches_fn(
-    matched_nodes, component_afs, person_spread,
-    spark=spark, write_path=f"{SPLIT_PATH}/component_matches_single_afs",
+    label_nodes, component_afs, person_spread,
+    spark=spark, write_path=f"{SPLIT_PATH}/component_matches_single_afs{_LABEL_SUFFIX}",
 )
 
 # COMMAND ----------
@@ -754,7 +771,7 @@ _is_giant = _size_pd["size_order"] >= GIANT_MIN_SIZE
 _giant = _size_pd[_is_giant][_count_cols].sum()
 _tot_ng = _add_rates(_size_pd[~_is_giant][_count_cols].sum().to_frame().T)
 _people = person_split_summary.toPandas().iloc[0]
-print(f"=== [{SCORE_SPLIT}] headline: {GRAPH_ROOT}, {SAMPLE_PCT}% of components ===")
+print(f"=== [{SCORE_SPLIT}, labels: {LABEL_SET}] headline: {GRAPH_ROOT}, {SAMPLE_PCT}% of components ===")
 print(f"components:                {int(_tot['n_components'].iloc[0]):,}")
 print(f"% over-merged (components): {_tot['pct_over_merged'].iloc[0]}  (judgeable only: {_tot['pct_over_merged_judgeable'].iloc[0]})")
 print(f"% over-merged (IDs):        {_tot['pct_ids_over_merged'].iloc[0]}")
@@ -988,7 +1005,7 @@ def pair_health_fn(parts, summary_df, spark=None, write_path=None):
 _pair_parts = []
 for _via, _key_col in VIA_KEY_COLS:
     _members = pair_members_fn(
-        nodes, matched_nodes, component_summary, _via, _key_col,
+        nodes, label_nodes, component_summary, _via, _key_col,
         spark=spark, write_path=f"{OUT_SPLIT_PATH}/graph_pair_members_{_via}",
     )
     _pair_parts.append(source_pairs_fn(_members, spark=spark, write_path=f"{OUT_SPLIT_PATH}/graph_pairs_{_via}"))

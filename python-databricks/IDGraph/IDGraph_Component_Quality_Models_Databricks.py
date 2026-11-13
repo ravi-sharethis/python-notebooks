@@ -10,7 +10,8 @@
 # MAGIC (`IDGraph_Component_Quality_Databricks.py`). Design: `IDGraph_Journal.md` §14.
 # MAGIC
 # MAGIC **Run notebook A twice first** (`SCORE_SPLIT = "tune"` and `"holdout"`) on
-# MAGIC the same GRAPH_ROOT.
+# MAGIC the same GRAPH_ROOT and LABEL_SET. Labels: `LABEL_SET = "all"` (HEM + IDFA +
+# MAGIC AAID matches) or `"hem"` (HEM matches only) -- run A x 2 and B once per set.
 # MAGIC
 # MAGIC | model | idea |
 # MAGIC |---|---|
@@ -90,10 +91,19 @@ dbutils.widgets.text("SAMPLE_PCT", "100")
 SAMPLE_PCT = int(dbutils.widgets.get("SAMPLE_PCT"))
 QUALITY_ROOT = f"{GRAPH_ROOT}/component_quality" + ("" if SAMPLE_PCT >= 100 else f"_sample{SAMPLE_PCT}")
 GRAPH_PATH = f"{QUALITY_ROOT}/graph"
-TRAIN_SPLIT_PATH = f"{QUALITY_ROOT}/tune"
-EVAL_SPLIT_PATH = f"{QUALITY_ROOT}/holdout"
+# Which notebook A labels to train and test on: "all" (HEM + IDFA + AAID
+# matches) or "hem" (HEM matches only). A must have run with the same LABEL_SET
+# on both splits. Run B once per label set: 3 targets x 2 label sets.
+dbutils.widgets.dropdown("LABEL_SET", "all", ["all", "hem"])
+LABEL_SET = dbutils.widgets.get("LABEL_SET")
+_LABEL_SUFFIX = "" if LABEL_SET == "all" else f"_{LABEL_SET}"
+TRAIN_SPLIT_PATH = f"{QUALITY_ROOT}/tune{_LABEL_SUFFIX}"
+EVAL_SPLIT_PATH = f"{QUALITY_ROOT}/holdout{_LABEL_SUFFIX}"
 # v2: node + multi-source pair count features, healthy target.
-MODELS_PATH = f"{QUALITY_ROOT}/models_v2"
+MODELS_PATH = f"{QUALITY_ROOT}/models_v2{_LABEL_SUFFIX}"
+# Pair features don't depend on labels, so both label sets share them. They're
+# written by whichever B task runs first -- run the two B tasks one after the other.
+PAIRS_PATH = f"{QUALITY_ROOT}/models_v2_pairs"
 # filtered_base/fanout, for the pair features.
 SOURCE_BUILD_PATH = f"{GRAPH_ROOT}/build_output"
 
@@ -291,9 +301,9 @@ def pair_features_fn(parts, spark=None, write_path=None):
 nodes = spark.read.parquet(f"{GRAPH_PATH}/nodes").drop("slice")
 _pair_parts = []
 for _via, _key_col in VIA_KEY_COLS:
-    _members = pair_members_fn(nodes, _via, _key_col, spark=spark, write_path=f"{MODELS_PATH}/pair_members_{_via}")
-    _pair_parts.append(source_pairs_fn(_members, spark=spark, write_path=f"{MODELS_PATH}/pairs_{_via}"))
-pair_features = pair_features_fn(_pair_parts, spark=spark, write_path=f"{MODELS_PATH}/pair_features")
+    _members = pair_members_fn(nodes, _via, _key_col, spark=spark, write_path=f"{PAIRS_PATH}/pair_members_{_via}")
+    _pair_parts.append(source_pairs_fn(_members, spark=spark, write_path=f"{PAIRS_PATH}/pairs_{_via}"))
+pair_features = pair_features_fn(_pair_parts, spark=spark, write_path=f"{PAIRS_PATH}/pair_features")
 
 _pf = pair_features.agg(
     F.count("*").alias("n"), F.sum((F.col("n_pair_source_sets") > 1).cast("long")).alias("n_mixed")
@@ -311,7 +321,7 @@ print(
 # MAGIC node, matched or not. Types: HEM, IDFA, AAID, TTD, ID5_UID, ST. Sources:
 # MAGIC id5, liid, tapad.
 # MAGIC
-# MAGIC **Glossary** (all counts per component; the model sees log2(1 + count))
+# MAGIC **Glossary** (counts are per component; the model sees log2(1 + count))
 # MAGIC
 # MAGIC | feature | meaning |
 # MAGIC |---|---|
@@ -320,6 +330,9 @@ print(
 # MAGIC | `node_<source>_<T>` | nodes of type T that the source links (the node shares a kept key with another node in that source), e.g. `node_tapad_IDFA`. A node linked by two sources counts under both |
 # MAGIC | `pair_<A>_<B>` | multi-source pairs (two nodes that 2+ sources link) joining types A and B, e.g. `pair_HEM_IDFA` |
 # MAGIC | `pair_<source>` | multi-source pairs that the source links, e.g. `pair_liid` |
+# MAGIC | `alone_<source>` | singletons only: 1 if the node's keys in that source hold only itself |
+# MAGIC | `log2_dropped_<source>` | singletons only: the node's key in that source was over the cap; log2(1 + that key's size) |
+# MAGIC | `denylisted` | singletons only: 1 if the node's only shared key is denylisted |
 # MAGIC
 # MAGIC Example: one HEM-IDFA pair linked by liid and tapad gives `pair_HEM_IDFA` = 1,
 # MAGIC `pair_liid` = 1, `pair_tapad` = 1.
@@ -329,14 +342,15 @@ print(
 # MAGIC pair had which sources. The pair cell above prints how often that happens.
 # MAGIC
 # MAGIC Other columns kept for the lookup and NB models only (not LR features):
-# MAGIC `sources`, `type_set`, `size_bucket`, singleton reason and dropped size.
+# MAGIC `sources`, `type_set`, `size_bucket`, `reason_key`, `dropped_bucket`.
 
 # COMMAND ----------
 
 NODE_FEATURES = [f"node_{t}" for t in ID_TYPES] + [f"node_{v}_{t}" for v in VIA_LABELS for t in ID_TYPES]
 PAIR_FEATURES = [_col_name("pair_", tp) for tp in TYPE_PAIRS] + [f"pair_{v}" for v in VIA_LABELS]
 COUNT_FEATURES = NODE_FEATURES + PAIR_FEATURES
-LR_FEATURES = ["log2_size"] + [f"log2_{c}" for c in COUNT_FEATURES]
+SINGLETON_FEATURES = [f"alone_{v}" for v in VIA_LABELS] + [f"log2_dropped_{v}" for v in VIA_LABELS] + ["denylisted"]
+LR_FEATURES = ["log2_size"] + [f"log2_{c}" for c in COUNT_FEATURES] + SINGLETON_FEATURES
 
 
 @stage_dataframe(write_format="parquet")
@@ -355,6 +369,7 @@ def features_fn(summary_df, tokens_df, pairs_df, slice_id=0, n_slices=1, spark=N
     keep = (
         ["component", "component_size", "sources", "type_set", "size_bucket"]
         + ["singleton_type", "singleton_reasons", "min_dropped_size"]
+        + [f"dropped_size_{v}" for v in VIA_LABELS]
         + [F.col(f"n_type_{t}").alias(f"node_{t}") for t in ID_TYPES]
     )
     f = (
@@ -376,7 +391,12 @@ def features_fn(summary_df, tokens_df, pairs_df, slice_id=0, n_slices=1, spark=N
     )
     for c in COUNT_FEATURES:
         f = f.withColumn(f"log2_{c}", _LOG2(F.col(c)))
-    return f
+    reasons = F.coalesce(F.col("singleton_reasons"), F.lit(""))
+    for v in VIA_LABELS:
+        f = f.withColumn(f"alone_{v}", reasons.contains(f"{v}:alone").cast("double")).withColumn(
+            f"log2_dropped_{v}", _LOG2(F.col(f"dropped_size_{v}"))
+        )
+    return f.withColumn("denylisted", reasons.contains("denylisted").cast("double"))
 
 
 @stage_dataframe(write_format="parquet")
