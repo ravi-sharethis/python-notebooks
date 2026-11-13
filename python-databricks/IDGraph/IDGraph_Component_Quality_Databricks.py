@@ -825,3 +825,71 @@ print(
 )
 print("# has_type_size")
 print(has_type_pd.sort_values(["id_type", "size_order", "has_type"]).drop(columns="size_order").to_csv(index=False))
+
+# COMMAND ----------
+
+# MAGIC %md ## Which source + node type make healthy components
+# MAGIC Judgeable multi-node components only (a singleton can't show 2 people). A token
+# MAGIC is `<sources linking the node>:<node type>`, as in `component_tokens`; a
+# MAGIC component counts once for each token it contains. On the judgeable base:
+# MAGIC - `pct_over_merged` = 2+ people in the component
+# MAGIC - `pct_incomplete` = its person also has nodes in another component
+# MAGIC - `pct_healthy` = neither
+# MAGIC
+# MAGIC Size drives both errors, so each rate is also compared with components of the
+# MAGIC same size: `*_lift` = observed / expected from the overall rate in each size
+# MAGIC bucket, weighted by the token's size mix. `healthy_lift` > 1 = healthier than
+# MAGIC size alone predicts. Absolute rates depend on the split's size (journal);
+# MAGIC lifts compare within one split.
+
+# COMMAND ----------
+
+_OUTCOMES = ["over_merged", "incomplete", "healthy"]
+
+
+def _health_counts(df, cols):
+    return df.groupBy(*cols).agg(
+        F.count("*").alias("n_judgeable"),
+        F.sum(F.col("over_merged").cast("long")).alias("n_over_merged"),
+        F.sum(F.col("incomplete").cast("long")).alias("n_incomplete"),
+        F.sum((~F.col("over_merged") & ~F.col("incomplete")).cast("long")).alias("n_healthy"),
+    )
+
+
+@stage_dataframe(write_format="parquet")
+def token_health_fn(tokens_df, summary_df, spark=None, write_path=None):
+    judged = summary_df.filter(F.col("judgeable")).select("component", "size_bucket", "over_merged", "incomplete")
+    return _health_counts(tokens_df.select("component", "token").join(judged, on="component"), ["token", "size_bucket"])
+
+
+token_health = token_health_fn(
+    component_tokens, component_summary, spark=spark, write_path=f"{OUT_SPLIT_PATH}/token_health"
+)
+size_health = _health_counts(component_summary.filter(F.col("judgeable")), ["size_bucket"]).toPandas()
+
+_th = token_health.toPandas()
+_th["sources"] = _th["token"].str.rsplit(":", n=1).str[0]
+_th["node_type"] = _th["token"].str.rsplit(":", n=1).str[1]
+_size_rate = size_health.set_index("size_bucket")
+for _o in _OUTCOMES:
+    _th[f"exp_{_o}"] = _th["n_judgeable"] * _th["size_bucket"].map(_size_rate[f"n_{_o}"] / _size_rate["n_judgeable"])
+
+
+def _health_view(cols):
+    g = _th.groupby(cols, as_index=False)[
+        ["n_judgeable"] + [f"n_{o}" for o in _OUTCOMES] + [f"exp_{o}" for o in _OUTCOMES]
+    ].sum()
+    for o in _OUTCOMES:
+        g[f"pct_{o}"] = (100 * g[f"n_{o}"] / g["n_judgeable"]).round(1)
+        g[f"{o}_lift"] = (g[f"n_{o}"] / g[f"exp_{o}"]).round(2)
+    show = ["n_judgeable"] + [f"pct_{o}" for o in _OUTCOMES] + [f"{o}_lift" for o in _OUTCOMES]
+    return g[cols + show].sort_values("healthy_lift", ascending=False)
+
+
+for _cols in [["node_type"], ["sources"], ["sources", "node_type"]]:
+    print(f"=== [{SCORE_SPLIT}] health by {' x '.join(_cols)} (judgeable multi-node components) ===")
+    print(_health_view(_cols).to_string(index=False))
+    print()
+
+print("# token_health by size (CSV)")
+print(_th.drop(columns=[f"exp_{o}" for o in _OUTCOMES]).sort_values(["token", "size_bucket"]).to_csv(index=False))

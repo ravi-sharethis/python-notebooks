@@ -143,3 +143,27 @@ testing, but expect a modest gain; component size is the strong signal. Also, on
 judgeable base the sources are similar at a fixed size (about 48-54% at 9-16 nodes).
 The earlier "liid cleanest" reading was detection bias.
 Full report: `IDGraph-local/reports/idgraph5_component_quality_report.html`.
+
+## B: LR coefficients and NB token rates, tune (pasted 2026-11-12)
+over_merged LR (intercept -2.179): log2_size +0.686, share_hem +0.669,
+has_group_tapad +0.311, share_maid +0.223, has_hem_and_maid +0.146,
+log2_max_group_liid +0.114, has_group_id5 +0.109, log2_max_group_tapad -0.100,
+share_tapad -0.376, share_other -0.675, share_id5 -0.863, share_liid -0.954.
+
+incomplete LR (intercept 1.616): share_maid +0.935, is_singleton +0.183,
+log2_max_group_liid +0.108, log2_size +0.072, alone_tapad -0.475,
+has_hem_and_maid -0.453, share_tapad -0.435, share_id5 -0.530, share_hem -0.848,
+share_liid -1.224.
+
+over_merged NB token rates (shrunk): tapad:* 0.54-0.60; id5:ID5_UID 0.64;
+liid:* 0.71-0.78; liid+tapad:HEM 0.75, liid+tapad:IDFA 0.82, liid+tapad:AAID 0.83.
+incomplete: dropped MAID singletons 0.93-0.96 (tapad, liid, both); dropped HEM
+singletons 0.66-0.76; singleton[tapad:alone]:IDFA 0.94, :HEM 0.61;
+dropped_size buckets 17-24 .. 129-256: 0.80-0.86 (flat); multi-node tokens 0.74-0.84.
+
+Reading: token rates track component size (multi-source and liid nodes sit in
+bigger components), so they rank liid+tapad nodes worst even though liid+tapad
+pairs agree best at pair level (journal 13). Not usable as node/source weights.
+LR, which holds size fixed, says the opposite for sources: more liid/id5 share
+-> less over-merge than tapad share. MAID-heavy components are the incomplete ones;
+dropped MAID singletons almost always belong to a person found elsewhere.
