@@ -68,6 +68,7 @@ import pandas as pd
 
 GRAPH_ROOT = "s3://data-science-research/ravi/IDGraph5"
 SOURCE_BUILD_PATH = f"{GRAPH_ROOT}/build_output"
+RESULT_PATH = f"{GRAPH_ROOT}/cc_output/result"  # delta: id, component, component_size
 LADDER_ROOT = "s3://data-science-research/ravi/IDGraph5_ladder"
 
 # Must match the notebook A run (job-level parameters).
@@ -111,7 +112,7 @@ CLASS_VERSION = {
 }
 VERSIONS = [1, 2, 3, 4, 5]
 
-_inputs = [f"{A_SAMPLE_ROOT}/graph/nodes"] + [
+_inputs = [RESULT_PATH, f"{A_SAMPLE_ROOT}/graph/nodes"] + [
     f"{_QUALITY}/{s}/{t}"
     for s in SPLITS
     for t in ("matched_nodes", f"component_afs_single_afs{_LABEL_SUFFIX}", f"person_spread_single_afs{_LABEL_SUFFIX}")
@@ -357,19 +358,40 @@ version_components = version_components_fn(
 # MAGIC + its components outside it (`n_components` from notebook A minus those
 # MAGIC inside). Over-merged / judgeable / healthy follow notebook A: judgeable =
 # MAGIC 2+ single-person nodes, over-merged = 2+ distinct Affinity persons,
-# MAGIC incomplete = an Affinity person in it has nodes in another component.
+# MAGIC incomplete = an Affinity person in it has nodes in another component;
+# MAGIC incomplete_multi = ... in another multi-node component (stranded singletons
+# MAGIC don't count). `base_multi` (per split): each Affinity person's multi-node
+# MAGIC components in today's graph, from the matched nodes and the component table.
 
 # COMMAND ----------
 
 
 @stage_dataframe(write_format="parquet")
-def person_versions_fn(vc_df, eval_df, comp_afs_df, spread_df, split, spark=None, write_path=None):
+def base_multi_fn(matched_df, result_df, spark=None, write_path=None):
+    m = matched_df.filter(F.size("afs_ids") == 1)
+    if LABEL_SET == "hem":
+        m = m.filter(F.col("node_id").startswith("HEM_"))
+    sizes = result_df.select(F.col("id").alias("node_id"), "component_size")
+    return (
+        m.select("node_id", "component", F.col("afs_ids")[0].cast("string").alias("afs_id"))
+        .join(sizes, on="node_id")
+        .filter(F.col("component_size") >= 2)
+        .groupBy("afs_id")
+        .agg(F.countDistinct("component").alias("n_base_multi_total"))
+    )
+
+
+@stage_dataframe(write_format="parquet")
+def person_versions_fn(vc_df, eval_df, comp_afs_df, spread_df, multi_df, split, spark=None, write_path=None):
     afs_col = f"afs_list_{split}"
     in_v = (
         vc_df.filter(F.size(afs_col) > 0)
-        .select("version", "vcomp", F.explode(afs_col).alias("afs_id"))
+        .select("version", "vcomp", "size", F.explode(afs_col).alias("afs_id"))
         .groupBy("version", "afs_id")
-        .agg(F.countDistinct("vcomp").alias("n_v_in"))
+        .agg(
+            F.countDistinct("vcomp").alias("n_v_in"),
+            F.countDistinct(F.when(F.col("size") >= 2, F.col("vcomp"))).alias("n_v_multi_in"),
+        )
     )
     eval_comps = eval_df.select("component").distinct()
     base_in = (
@@ -379,10 +401,14 @@ def person_versions_fn(vc_df, eval_df, comp_afs_df, spread_df, split, spark=None
         .agg(F.countDistinct("component").alias("n_base_in"))
     )
     spread = spread_df.select(F.col("afs_id").cast("string").alias("afs_id"), "n_nodes", F.col("n_components").alias("n_base_total"))
+    # Evaluated components are all multi-node, so n_base_in also counts the multi-node ones inside.
     return (
         in_v.join(base_in, on="afs_id")
         .join(spread, on="afs_id")
+        .join(multi_df, on="afs_id", how="left")
+        .fillna({"n_base_multi_total": 0})
         .withColumn("n_spread", F.col("n_v_in") + F.col("n_base_total") - F.col("n_base_in"))
+        .withColumn("n_spread_multi", F.col("n_v_multi_in") + F.col("n_base_multi_total") - F.col("n_base_in"))
     )
 
 
@@ -392,19 +418,23 @@ def version_metrics_fn(vc_df, person_df, split, spark=None, write_path=None):
     labelled = vc_df.filter(F.size(afs_col) > 0)
     incomplete = (
         labelled.select("version", "vcomp", F.explode(afs_col).alias("afs_id"))
-        .join(person_df.select("version", "afs_id", "n_spread"), on=["version", "afs_id"])
+        .join(person_df.select("version", "afs_id", "n_spread", "n_spread_multi"), on=["version", "afs_id"])
         .groupBy("version", "vcomp")
-        .agg(F.max((F.col("n_spread") >= 2).cast("int")).alias("incomplete"))
+        .agg(
+            F.max((F.col("n_spread") >= 2).cast("int")).alias("incomplete"),
+            F.max((F.col("n_spread_multi") >= 2).cast("int")).alias("incomplete_multi"),
+        )
     )
     v = (
         vc_df.join(incomplete, on=["version", "vcomp"], how="left")
-        .fillna({"incomplete": 0})
+        .fillna({"incomplete": 0, "incomplete_multi": 0})
         .withColumn("n_afs", F.size(afs_col))
         .withColumn("size_bucket", _size_bucket("size", COMPONENT_SIZE_BOUNDS))
     )
     judgeable = F.col(f"n_single_{split}") >= 2
     over = F.col("n_afs") >= 2
     inc = (F.col("n_afs") >= 1) & (F.col("incomplete") == 1)
+    inc_multi = (F.col("n_afs") >= 1) & (F.col("incomplete_multi") == 1)
     n = F.col("n_comps")
     return v.groupBy("version", "size_bucket").agg(
         F.min("size").alias("size_order"),
@@ -417,16 +447,21 @@ def version_metrics_fn(vc_df, person_df, split, spark=None, write_path=None):
         F.sum(F.when(inc, n).otherwise(0)).alias("n_incomplete_labelled"),
         F.sum(F.when(judgeable & inc, n).otherwise(0)).alias("n_incomplete"),
         F.sum(F.when(judgeable & ~over & ~inc, n).otherwise(0)).alias("n_healthy"),
+        F.sum(F.when(judgeable & inc_multi, n).otherwise(0)).alias("n_incomplete_multi"),
+        F.sum(F.when(judgeable & ~over & ~inc_multi, n).otherwise(0)).alias("n_healthy_multi"),
     )
 
 
+result = spark.read.format("delta").load(RESULT_PATH)
 person_versions = {}
 version_metrics = {}
 for _s in SPLITS:
+    _base_multi = base_multi_fn(matched[_s], result, spark=spark, write_path=f"{OUT_SPLIT_PATH[_s]}/base_multi")
     person_versions[_s] = person_versions_fn(
         version_components, eval_nodes,
         _read(f"{_QUALITY}/{_s}/component_afs_single_afs{_LABEL_SUFFIX}"),
         _read(f"{_QUALITY}/{_s}/person_spread_single_afs{_LABEL_SUFFIX}"),
+        _base_multi,
         _s, spark=spark, write_path=f"{OUT_SPLIT_PATH[_s]}/person_versions",
     )
     version_metrics[_s] = version_metrics_fn(
@@ -436,20 +471,56 @@ for _s in SPLITS:
 # COMMAND ----------
 
 # MAGIC %md ## Results
-# MAGIC - links added per version (cumulative share)
-# MAGIC - scale per version (no labels): components, singletons, multi-node
-# MAGIC   components, mean / max size, size distribution, and a whole-graph estimate
-# MAGIC - per split, per version: components, singletons, % targetable, and the
-# MAGIC   judgeable rates (% over-merged, % incomplete, % healthy), plus % of
-# MAGIC   Affinity persons split
-# MAGIC - per split: % healthy of judgeable by version x size (compare at a fixed size)
+# MAGIC Printed per version (V1..V5; V5 = today's graph on the same components).
+# MAGIC Compare versions within a split: tune holds 70% of Affinity persons and
+# MAGIC holdout 30%, so absolute rates differ between splits.
 # MAGIC
-# MAGIC Tune vs holdout absolute rates differ (70% vs 30% of persons): compare
-# MAGIC versions within a split.
+# MAGIC **Glossary**
+# MAGIC
+# MAGIC | column | meaning |
+# MAGIC |---|---|
+# MAGIC | `level` / `n_pairs` / `cum_pct` | links first added in that version / how many / cumulative % of all links |
+# MAGIC | `n_links` | links in the version (cumulative) |
+# MAGIC | `n_nodes` | nodes evaluated (the same in every version) |
+# MAGIC | `n_multi_node` | components with 2+ nodes |
+# MAGIC | `nodes_in_multi`, `pct_nodes_in_multi` | nodes in those components, and their % of all nodes |
+# MAGIC | `mean_multi_size`, `max_size` | mean size of multi-node components; largest component |
+# MAGIC | `n_singletons` | nodes left with no link (1-node components) |
+# MAGIC | `n_total` | `n_multi_node` + `n_singletons` |
+# MAGIC | `est_full_*` | the count scaled from the sample to the whole graph (giant and today's singletons excluded) |
+# MAGIC | `n_components` | components in that row (multi-node or singleton block) |
+# MAGIC | `n_targetable` | components with 1+ Affinity-matched node (any number of Affinity persons) |
+# MAGIC | `n_labelled` | components with 1+ node matched to exactly one Affinity person |
+# MAGIC | `n_judgeable` | components with 2+ such nodes (over-merging can be seen) |
+# MAGIC | `pct_pure` | judgeable components holding one Affinity person (= 100 - `pct_over_merged`) |
+# MAGIC | `pct_over_merged` | judgeable components holding 2+ Affinity persons |
+# MAGIC | `pct_incomplete` | judgeable components where an Affinity person also has nodes in another component (singletons included) |
+# MAGIC | `pct_healthy` | judgeable, pure and not incomplete |
+# MAGIC | `pct_incomplete_multi` | as `pct_incomplete`, but only counting the person's nodes in other multi-node components |
+# MAGIC | `pct_healthy_multi` | pure and not `incomplete_multi`: the components' own quality, ignoring stranded singletons |
+# MAGIC | `n_incomplete_labelled`, `pct_incomplete_labelled` | labelled singletons whose Affinity person has nodes elsewhere |
+# MAGIC | `pct_persons_split` | Affinity persons with 2+ nodes whose nodes sit in 2+ components |
+# MAGIC
+# MAGIC Size tables: rows = component size bucket, columns = version; `(n)` = judgeable components in the cell.
 
 # COMMAND ----------
 
 pd.set_option("display.width", 250)
+
+# Size buckets in size order (a bucket's smallest size can differ by version).
+_BUCKET_ORDER = {}
+_lo = COMPONENT_SIZE_BOUNDS[0]
+for _hi in COMPONENT_SIZE_BOUNDS:
+    _BUCKET_ORDER[str(_hi) if _lo == _hi else f"{_lo}-{_hi}"] = len(_BUCKET_ORDER)
+    _lo = _hi + 1
+_BUCKET_ORDER[f"{COMPONENT_SIZE_BOUNDS[-1] + 1}+"] = len(_BUCKET_ORDER)
+
+
+def _by_size(df, values):
+    """version x size_bucket pivot, rows in size order."""
+    piv = df.pivot(index="size_bucket", columns="version", values=values)
+    return piv.loc[sorted(piv.index, key=_BUCKET_ORDER.get)]
+
 
 _lp = ladder_pairs.groupBy("level").agg(F.count("*").alias("n_pairs")).toPandas().sort_values("level")
 _lp["cum_pct"] = (100 * _lp["n_pairs"].cumsum() / _lp["n_pairs"].sum()).round(1)
@@ -457,15 +528,15 @@ print("=== links added per version (level = the version that adds them) ===")
 print(_lp.to_string(index=False))
 print()
 
-# Scale (no labels): same nodes in every version, split into more, smaller components
-# as links are removed. V5 = today's graph on these components. est_full_* scales the
-# sample to the whole graph (excluding the giant and today's singletons).
+# Scale (no labels): same nodes in every version; a node with no link is a singleton.
+# V5 = today's graph on these components. est_full_* scales the sample to the whole
+# graph (excluding the giant and today's singletons).
 _sc = (
     version_components.groupBy("version")
     .agg(
-        F.sum("n_comps").alias("n_components"),
-        F.sum(F.when(F.col("size") == 1, F.col("n_comps")).otherwise(0)).alias("n_singletons"),
         F.sum(F.when(F.col("size") >= 2, F.col("n_comps")).otherwise(0)).alias("n_multi_node"),
+        F.sum(F.when(F.col("size") == 1, F.col("n_comps")).otherwise(0)).alias("n_singletons"),
+        F.sum("n_comps").alias("n_total"),
         F.sum(F.col("size") * F.col("n_comps")).alias("n_nodes"),
         F.sum(F.when(F.col("size") >= 2, F.col("size") * F.col("n_comps")).otherwise(0)).alias("nodes_in_multi"),
         F.max("size").alias("max_size"),
@@ -474,66 +545,73 @@ _sc = (
     .sort_values("version")
 )
 _sc["n_links"] = _lp.set_index("level")["n_pairs"].cumsum().reindex(_sc["version"]).values
-_sc["pct_nodes_singleton"] = (100 * _sc["n_singletons"] / _sc["n_nodes"]).round(2)
+_sc["pct_nodes_in_multi"] = (100 * _sc["nodes_in_multi"] / _sc["n_nodes"]).round(2)
 _sc["mean_multi_size"] = (_sc["nodes_in_multi"] / _sc["n_multi_node"].where(_sc["n_multi_node"] > 0)).round(2)
 _scale = 100 / SAMPLE_PCT
-for _c in ("n_components", "n_singletons", "n_multi_node"):
+for _c in ("n_multi_node", "n_singletons", "n_total"):
     _sc[f"est_full_{_c}"] = (_sc[_c] * _scale).round().astype("int64")
 print(f"=== scale per version: {SAMPLE_PCT}% sample of today's multi-node components (giant excluded) ===")
 print(_sc[[
-    "version", "n_links", "n_nodes", "n_components", "n_singletons", "pct_nodes_singleton",
-    "n_multi_node", "mean_multi_size", "max_size", "est_full_n_components", "est_full_n_singletons", "est_full_n_multi_node",
+    "version", "n_links", "n_nodes", "n_multi_node", "nodes_in_multi", "pct_nodes_in_multi", "mean_multi_size",
+    "max_size", "n_singletons", "n_total", "est_full_n_multi_node", "est_full_n_singletons", "est_full_n_total",
 ]].to_string(index=False))
 print()
 _sd = (
     version_components.withColumn("size_bucket", _size_bucket("size", COMPONENT_SIZE_BOUNDS))
     .groupBy("version", "size_bucket")
-    .agg(F.min("size").alias("size_order"), F.sum("n_comps").alias("n_components"))
+    .agg(F.sum("n_comps").alias("n_components"))
     .toPandas()
 )
-print("=== components by size, per version ===")
-print(_sd.pivot(index=["size_order", "size_bucket"], columns="version", values="n_components").fillna(0).astype("int64").reset_index(level=0, drop=True).to_string())
+print("=== components by size, per version (size 1 = singletons) ===")
+print(_by_size(_sd, "n_components").fillna(0).astype("int64").to_string())
 print()
 
 
 def _rates(df):
     df = df.copy()
-    df["pct_targetable"] = (100 * df["n_targetable"] / df["n_components"]).round(2)
+    j = df["n_judgeable"].where(df["n_judgeable"] > 0)
+    df["n_pure"] = df["n_judgeable"] - df["n_over_merged"]
+    for k in ("pure", "over_merged", "incomplete", "healthy", "incomplete_multi", "healthy_multi"):
+        df[f"pct_{k}"] = (100 * df[f"n_{k}"] / j).round(2)
     df["pct_incomplete_labelled"] = (100 * df["n_incomplete_labelled"] / df["n_labelled"].where(df["n_labelled"] > 0)).round(2)
-    for k in ("over_merged", "incomplete", "healthy"):
-        df[f"pct_{k}"] = (100 * df[f"n_{k}"] / df["n_judgeable"].where(df["n_judgeable"] > 0)).round(2)
     return df
 
 
-# pct_over_merged / pct_incomplete / pct_healthy are of judgeable components (as in notebook A's
-# health tables); pct_incomplete_labelled is of all labelled components (A's headline pct_incomplete).
-_SHOW = [
-    "n_components", "n_singletons", "n_targetable", "pct_targetable", "n_judgeable",
-    "pct_over_merged", "pct_incomplete", "pct_healthy", "pct_incomplete_labelled",
+_COUNT_COLS = ["n_components", "n_nodes", "n_targetable", "n_labelled", "n_judgeable", "n_over_merged",
+               "n_incomplete_labelled", "n_incomplete", "n_healthy", "n_incomplete_multi", "n_healthy_multi"]
+_MULTI_SHOW = [
+    "n_components", "n_targetable", "n_judgeable", "pct_pure", "pct_over_merged",
+    "pct_incomplete", "pct_healthy", "pct_incomplete_multi", "pct_healthy_multi",
 ]
+_SINGLE_SHOW = ["n_components", "n_labelled", "n_incomplete_labelled", "pct_incomplete_labelled"]
 for _s in SPLITS:
     _m = version_metrics[_s].toPandas()
-    _tot = _m.groupby("version", as_index=False)[[c for c in _m.columns if c.startswith("n_")]].sum()
-    _tot["n_singletons"] = _tot["version"].map(_m[_m["size_bucket"] == "1"].set_index("version")["n_components"]).fillna(0).astype(int)
-    _tot = _rates(_tot)
+    _is_single = _m["size_bucket"] == "1"
+    _multi = _rates(_m[~_is_single].groupby("version", as_index=False)[_COUNT_COLS].sum())
+    _single = _rates(
+        _m[_is_single].groupby("version", as_index=False)[_COUNT_COLS].sum().set_index("version")
+        .reindex(VERSIONS, fill_value=0).reset_index()
+    )
     _pv = person_versions[_s].filter(F.col("n_nodes") >= 2).groupBy("version").agg(
         F.count("*").alias("n_persons"), F.sum((F.col("n_spread") >= 2).cast("int")).alias("n_split")
     ).toPandas()
     _pv["pct_persons_split"] = (100 * _pv["n_split"] / _pv["n_persons"]).round(2)
-    _tot = _tot.merge(_pv[["version", "pct_persons_split"]], on="version", how="left")
-    print(f"=== [{_s}] per version (rates of judgeable components; % Affinity persons split = of those with 2+ nodes) ===")
-    print(_tot[["version"] + _SHOW + ["pct_persons_split"]].to_string(index=False))
+    print(f"=== [{_s}] multi-node components per version (rates of judgeable components) ===")
+    print(_multi.merge(_pv[["version", "pct_persons_split"]], on="version", how="left")[
+        ["version"] + _MULTI_SHOW + ["pct_persons_split"]
+    ].to_string(index=False))
     print()
-    _bs = _rates(_m[_m["n_judgeable"] > 0].sort_values(["size_order", "version"]))
-    print(f"=== [{_s}] % healthy of judgeable components, version x size (n_judgeable in brackets) ===")
-    _bs["cell"] = _bs["pct_healthy"].astype(str) + " (" + _bs["n_judgeable"].astype(int).astype(str) + ")"
-    _piv = _bs.pivot(index=["size_order", "size_bucket"], columns="version", values="cell").fillna("")
-    print(_piv.reset_index(level=0, drop=True).to_string())
+    print(f"=== [{_s}] singletons per version (incomplete = its Affinity person has nodes elsewhere) ===")
+    print(_single[["version"] + _SINGLE_SHOW].to_string(index=False))
     print()
-    for _k in ("over_merged", "incomplete"):
-        _piv = _bs.pivot(index=["size_order", "size_bucket"], columns="version", values=f"pct_{_k}").fillna("")
-        print(f"=== [{_s}] % {_k} of judgeable components, version x size ===")
-        print(_piv.reset_index(level=0, drop=True).to_string())
+    _bs = _rates(_m[~_is_single & (_m["n_judgeable"] > 0)])
+    _bs["cell"] = _bs["pct_pure"].astype(str) + " (" + _bs["n_judgeable"].astype(int).astype(str) + ")"
+    print(f"=== [{_s}] % pure (not over-merged) of judgeable multi-node components, version x size (n_judgeable) ===")
+    print(_by_size(_bs, "cell").fillna("").to_string())
+    print()
+    for _k in ("healthy", "healthy_multi", "incomplete", "incomplete_multi"):
+        print(f"=== [{_s}] % {_k} of judgeable multi-node components, version x size ===")
+        print(_by_size(_bs, f"pct_{_k}").fillna("").to_string())
         print()
 
 # COMMAND ----------
