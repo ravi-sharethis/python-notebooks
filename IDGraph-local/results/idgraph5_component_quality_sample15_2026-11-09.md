@@ -167,3 +167,35 @@ pairs agree best at pair level (journal 13). Not usable as node/source weights.
 LR, which holds size fixed, says the opposite for sources: more liid/id5 share
 -> less over-merge than tapad share. MAID-heavy components are the incomplete ones;
 dropped MAID singletons almost always belong to a person found elsewhere.
+
+---
+# Rerun 2026-11-12: healthy tables (A) and node/pair count models (B), 15% sample
+Commits dd5889d / 59f6b79. LABEL_SET=all (HEM+IDFA+AAID). Summary doc: https://claude.ai/artifact/1PwFmSBdb7x7VSeTE4H7Vu
+
+## Links: % same person (labelled pairs, tune / holdout)
+- by source set: liid+tapad 74.6 / 86.5; tapad only 58.7 / 76.8; liid only 54.7 / 73.1.
+- by type pair, liid+tapad vs tapad only (tune): AAID-IDFA 69 vs 36; HEM-IDFA 71 vs 42;
+  AAID-HEM 72 vs 44; AAID-AAID 84 vs 41; IDFA-IDFA 88 vs 62 (+26..+43 pts; +7..+34 vs liid only).
+  Holdout: liid+tapad 85-92 vs tapad only 57-78.
+- best single-source: tapad HEM-HEM 67 / 82. Worst type pair: AAID-IDFA 36 / 56.
+- liid+tapad pairs are rare: 354K of ~82M pairs in judgeable components (tune); 2,180 labelled.
+
+## Components (A): healthy lift at fixed size, all near 1
+- source x node type: 0.78-1.07 (tune), 0.83-1.08 (holdout). Lowest both splits: liid+tapad
+  IDFA/AAID (0.78-0.84), liid HEM/AAID/IDFA (0.81-0.92). Highest: liid+tapad TTD/HEM, id5+tapad ID5.
+- source set x type pair: 0.78-1.23. Highest both: liid+tapad HEM-TTD 1.13/1.13, id5+tapad
+  ID5-ID5 1.13/1.08. Lowest: single-source liid MAID pairs 0.85-0.92.
+- incomplete lift 0.98-1.02 everywhere.
+
+## Models (B, models_v2): holdout LR AUC
+- over_merged 0.672 (2-4 0.52, 5-16 0.58, 17-128 0.67, 129+ 0.64) -- same as before.
+- healthy 0.593 (0.56 / 0.56 / 0.60 / 0.56). incomplete 2+ 0.562, singletons 0.685.
+- coefficients: 2-source pair_AAID_IDFA -0.67 over / +0.32 healthy; pair_IDFA_IDFA -0.33 / +0.33;
+  node_HEM +0.53 over, -0.98 incomplete; node_IDFA +0.66, node_AAID +0.52 incomplete.
+- 15.3% of components with a 2-source pair (372K / 2.43M) mix source sets (split-feature caveat).
+
+## Reading
+Signal is at link level (2-source links far more often right), diluted at component level.
+B adds nothing beyond size. Next: graph variants that drop weak single-source links
+(V1 AAID-IDFA; V2 + MAID-MAID and liid-only MAID; V3 all single-source MAID) built from
+clique pairs, evaluated with notebook A (healthy, over-merged, people split, giant breakup).

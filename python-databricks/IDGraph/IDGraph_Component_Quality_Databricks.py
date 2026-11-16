@@ -136,13 +136,12 @@ DENYLIST = {
     },
 }
 
-# Off by default: run with elastic disk (autoscaling local storage) on the job
-# cluster. If a run still fills local disk, set True -- the heaviest steps (common
-# node_via_groups, nodes, component tokens/structure, matched nodes,
-# component_summary) then run in N_SLICES passes, each shuffling 1/N of the data,
-# at the cost of re-reading their inputs N times. Delete a step's folder before
-# changing SLICE_HEAVY_STEPS or N_SLICES for it.
-SLICE_HEAVY_STEPS = False
+# True: the heaviest steps (common node_via_groups, nodes, component tokens/structure,
+# matched nodes, component_summary) run in N_SLICES passes, each shuffling 1/N of the
+# data. The IDGraph5 tables on S3 were written with 8 slices, so this must stay True /
+# 8 to reuse them. Delete a step's folder before changing SLICE_HEAVY_STEPS or N_SLICES
+# for it.
+SLICE_HEAVY_STEPS = True
 N_SLICES = 8
 _N = N_SLICES if SLICE_HEAVY_STEPS else 1
 
@@ -1024,3 +1023,135 @@ for _cols in [["sources"], ["type_pair"], ["sources", "type_pair"]]:
 
 print("# pair_health by size (CSV)")
 print(_ph.sort_values(["sources", "type_pair", "size_bucket"]).to_csv(index=False))
+
+# COMMAND ----------
+
+# MAGIC %md ## Dropped singletons: is the rest of their Affinity person next to their dropped group?
+# MAGIC For each labelled singleton (one Affinity person) that a source dropped
+# MAGIC (its key was over the cap): take its oversized keys (MAX_FANOUT+1 ..
+# MAGIC OVERSIZE_MAX nodes), the other nodes in those keys ("co-members"), and
+# MAGIC their components. `found_any` = one of those components holds the same
+# MAGIC Affinity person; `found_top` = the component holding the most co-members
+# MAGIC does. High rates on incomplete singletons = reattaching a dropped node to
+# MAGIC its co-members' component would fix it. Graph-only candidate, Affinity only
+# MAGIC to check it.
+
+# COMMAND ----------
+
+OVERSIZE_MAX = 1024
+
+
+@stage_dataframe(write_format="parquet")
+def dropped_keys_fn(singletons_df, label_df, via_label, key_col, spark=None, write_path=None):
+    base = spark.read.parquet(f"{SOURCE_BUILD_PATH}/{via_label}_filtered_base").select("node_id", key_col)
+    deny = list(DENYLIST.get(via_label, set()))
+    if deny:
+        base = base.filter(~F.col(key_col).isin(deny))
+    oversized = (
+        spark.read.parquet(f"{SOURCE_BUILD_PATH}/{via_label}_fanout")
+        .filter((F.col("n_distinct") > MAX_FANOUT[via_label]) & (F.col("n_distinct") <= OVERSIZE_MAX))
+        .select(key_col)
+    )
+    single = (
+        singletons_df.filter(F.col(f"dropped_size_{via_label}").isNotNull())
+        .select("node_id")
+        .join(label_df.filter(F.size("afs_ids") == 1).select("node_id", F.col("afs_ids")[0].alias("afs_id")), on="node_id")
+    )
+    return (
+        base.join(single, on="node_id")
+        .join(oversized, on=key_col, how="leftsemi")
+        .select("node_id", "afs_id", F.col(key_col).cast("string").alias("key"))
+    )
+
+
+@stage_dataframe(write_format="parquet")
+def dropped_comembers_fn(keys_df, via_label, key_col, spark=None, write_path=None):
+    base = spark.read.parquet(f"{SOURCE_BUILD_PATH}/{via_label}_filtered_base").select(
+        F.col("node_id").alias("member"), F.col(key_col).cast("string").alias("key")
+    )
+    return (
+        keys_df.join(base, on="key")
+        .filter(F.col("member") != F.col("node_id"))
+        .select("node_id", "afs_id", "member")
+        .distinct()
+    )
+
+
+@stage_dataframe(write_format="parquet")
+def dropped_found_fn(parts, result_df, comp_afs_df, spark=None, write_path=None):
+    members = parts[0]
+    for p in parts[1:]:
+        members = members.unionByName(p)
+    comps = (
+        members.distinct()
+        .join(result_df.select(F.col("id").alias("member"), "component"), on="member")
+        .groupBy("node_id", "afs_id", "component")
+        .agg(F.count("*").alias("n_comembers"))
+    )
+    hit = comp_afs_df.select("component", "afs_id").withColumn("hit", F.lit(1))
+    # found_top counts ties: any component with the most co-members.
+    top_n = comps.groupBy("node_id").agg(F.max("n_comembers").alias("top_n"))
+    is_top = (F.col("n_comembers") == F.col("top_n")).cast("int")
+    return (
+        comps.join(hit, on=["component", "afs_id"], how="left")
+        .join(top_n, on="node_id")
+        .fillna({"hit": 0})
+        .groupBy("node_id", "afs_id")
+        .agg(
+            F.max("hit").alias("found_any"),
+            F.max(F.col("hit") * is_top).alias("found_top"),
+            F.count("*").alias("n_candidate_components"),
+        )
+    )
+
+
+@stage_dataframe(write_format="parquet")
+def dropped_summary_fn(found_df, singletons_df, summary_df, spark=None, write_path=None):
+    s = singletons_df.select("node_id", "component", _type_short("type").alias("singleton_type"), "singleton_reasons")
+    inc = summary_df.select("component", "incomplete")
+    return (
+        found_df.join(s, on="node_id")
+        .join(inc, on="component")
+        .groupBy("singleton_type", "singleton_reasons")
+        .agg(
+            F.count("*").alias("n_labelled"),
+            F.sum(F.col("incomplete").cast("long")).alias("n_incomplete"),
+            F.sum(F.when(F.col("incomplete"), F.col("found_any")).otherwise(0)).alias("n_found_any"),
+            F.sum(F.when(F.col("incomplete"), F.col("found_top")).otherwise(0)).alias("n_found_top"),
+            F.avg("n_candidate_components").alias("avg_candidate_components"),
+        )
+    )
+
+
+_dropped_parts = []
+for _via, _key_col in VIA_KEY_COLS:
+    _dk = dropped_keys_fn(
+        singletons, label_nodes, _via, _key_col, spark=spark, write_path=f"{OUT_SPLIT_PATH}/dropped_keys_{_via}"
+    )
+    _dropped_parts.append(
+        dropped_comembers_fn(_dk, _via, _key_col, spark=spark, write_path=f"{OUT_SPLIT_PATH}/dropped_comembers_{_via}")
+    )
+dropped_found = dropped_found_fn(
+    _dropped_parts, result, component_afs, spark=spark, write_path=f"{OUT_SPLIT_PATH}/dropped_found"
+)
+dropped_summary = dropped_summary_fn(
+    dropped_found, singletons, component_summary, spark=spark, write_path=f"{OUT_SPLIT_PATH}/dropped_summary"
+)
+
+_ds = dropped_summary.toPandas()
+_ds["pct_incomplete"] = (100 * _ds["n_incomplete"] / _ds["n_labelled"]).round(1)
+for _k in ("found_any", "found_top"):
+    _ds[f"pct_{_k}"] = (100 * _ds[f"n_{_k}"] / _ds["n_incomplete"].where(_ds["n_incomplete"] > 0)).round(1)
+_ds["avg_candidate_components"] = _ds["avg_candidate_components"].round(1)
+_dt = _ds[["n_labelled", "n_incomplete", "n_found_any", "n_found_top"]].sum()
+print(
+    f"=== [{SCORE_SPLIT}] dropped labelled singletons (keys {min(MAX_FANOUT.values()) + 1}..{OVERSIZE_MAX}): "
+    f"{int(_dt['n_labelled']):,}, incomplete {int(_dt['n_incomplete']):,}; of those, Affinity person found next to "
+    f"the dropped group: any {100 * _dt['n_found_any'] / max(_dt['n_incomplete'], 1):.1f}%, "
+    f"top component {100 * _dt['n_found_top'] / max(_dt['n_incomplete'], 1):.1f}% ==="
+)
+print(
+    _ds.sort_values("n_labelled", ascending=False)[
+        ["singleton_type", "singleton_reasons", "n_labelled", "pct_incomplete", "pct_found_any", "pct_found_top", "avg_candidate_components"]
+    ].to_string(index=False)
+)
