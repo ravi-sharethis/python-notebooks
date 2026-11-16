@@ -462,10 +462,10 @@ for _s in SPLITS:
         _read(f"{_QUALITY}/{_s}/component_afs_single_afs{_LABEL_SUFFIX}"),
         _read(f"{_QUALITY}/{_s}/person_spread_single_afs{_LABEL_SUFFIX}"),
         _base_multi,
-        _s, spark=spark, write_path=f"{OUT_SPLIT_PATH[_s]}/person_versions",
+        _s, spark=spark, write_path=f"{OUT_SPLIT_PATH[_s]}/person_versions_v2",
     )
     version_metrics[_s] = version_metrics_fn(
-        version_components, person_versions[_s], _s, spark=spark, write_path=f"{OUT_SPLIT_PATH[_s]}/version_metrics"
+        version_components, person_versions[_s], _s, spark=spark, write_path=f"{OUT_SPLIT_PATH[_s]}/version_metrics_v2"
     )
 
 # COMMAND ----------
