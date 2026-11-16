@@ -199,3 +199,41 @@ Signal is at link level (2-source links far more often right), diluted at compon
 B adds nothing beyond size. Next: graph variants that drop weak single-source links
 (V1 AAID-IDFA; V2 + MAID-MAID and liid-only MAID; V3 all single-source MAID) built from
 clique pairs, evaluated with notebook A (healthy, over-merged, people split, giant breakup).
+
+---
+# Link-class ladder V1..V5 + dropped singletons (runs 2026-11-15/16, commits c01c769..7080c5f)
+Ladder = IDGraph_Ladder_Databricks.py, 15% sample of today's multi-node components (giant excluded),
+270M nodes. V1 = 2+ source links; V2 += tapad HEM-HEM, liid HEM-IDFA, tapad IDFA-IDFA; V3 += liid
+IDFA-IDFA, liid AAID-HEM; V4 += the 6 rated classes <50%; V5 += single-source TTD/ID5_UID/ST = today.
+
+## Scale
+| version | links | multi-node comps | nodes in multi-node (%) | singletons | max size |
+|---|---|---|---|---|---|
+| V1 | 6.5M | 3.2M | 3.0 | 262M | 22 |
+| V2 | 61M | 14.0M | 17.0 | 224M | 72 |
+| V3 | 72M | 14.1M | 17.8 | 222M | 132 |
+| V4 | 219M | 17.4M | 30.4 | 188M | 156 |
+| V5 | 917M | 46.5M | 100 | 0 | 649 |
+
+## Quality at the same number of labelled nodes (judgeable, 2 labelled nodes; tune / holdout)
+| version | judgeable (tune) | % pure | % healthy_multi |
+|---|---|---|---|
+| V1 | 2,131 | 70.2 / 82.1 | 35.5 / 42.7 |
+| V2 | 413,861 | 61.1 / 77.7 | 30.2 / 38.5 |
+| V3 | 421,465 | 60.4 / 77.0 | 29.8 / 38.0 |
+| V4 | 541,825 | 52.9 / 71.0 | 24.7 / 33.2 |
+| V5 | 545,938 | 49.9 / 67.3 | 23.6 / 31.7 |
+Same ordering at 3-4 and 5-8 labelled nodes (5-8 tune pure: V2 45.4, V4 32.3, V5 20.7).
+By component size the ordering looked reversed (V2-V4 less pure than V5): detection bias, since
+versions without TTD/ID5/ST links hold more labelled nodes per component of a given size.
+Overall multi-node (tune/holdout): % pure V1 71/83, V2 60/78, V4 50/70, V5 46/66.
+
+## Dropped singletons (notebook A, tune, keys 17..1024)
+5.60M labelled dropped singletons, 4.68M incomplete; Affinity person in a co-member component: 55.9%;
+in the component with most co-members: 33.5%. MAID dropped by liid+tapad: 61-64% any, 41-43% top;
+avg 27-236 candidate components.
+
+## Reading
+Link-class quality carries to components: each step down the ladder raises purity (+3 drop
+TTD/ID5/ST single-source, +7 drop the <50% classes, ~0 V3->V2, +9 two-source only), at a large
+cost in linked nodes. V2 is the best balance so far; reattaching the rest = incomplete model (#4).
