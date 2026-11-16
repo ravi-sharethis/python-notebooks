@@ -413,7 +413,10 @@ def person_versions_fn(vc_df, eval_df, comp_afs_df, spread_df, multi_df, split, 
 
 
 @stage_dataframe(write_format="parquet")
-def version_metrics_fn(vc_df, person_df, split, spark=None, write_path=None):
+def version_metrics_fn(vc_df, person_df, split, by="size", spark=None, write_path=None):
+    # by="size": rows by component size; by="labelled": by the number of nodes matched to one
+    # Affinity person (n_single), so versions are compared with the same chance of seeing
+    # 2 Affinity persons. Both use the size-bucket labels, in column size_bucket.
     afs_col = f"afs_list_{split}"
     labelled = vc_df.filter(F.size(afs_col) > 0)
     incomplete = (
@@ -429,7 +432,7 @@ def version_metrics_fn(vc_df, person_df, split, spark=None, write_path=None):
         vc_df.join(incomplete, on=["version", "vcomp"], how="left")
         .fillna({"incomplete": 0, "incomplete_multi": 0})
         .withColumn("n_afs", F.size(afs_col))
-        .withColumn("size_bucket", _size_bucket("size", COMPONENT_SIZE_BOUNDS))
+        .withColumn("size_bucket", _size_bucket("size" if by == "size" else f"n_single_{split}", COMPONENT_SIZE_BOUNDS))
     )
     judgeable = F.col(f"n_single_{split}") >= 2
     over = F.col("n_afs") >= 2
@@ -455,6 +458,7 @@ def version_metrics_fn(vc_df, person_df, split, spark=None, write_path=None):
 result = spark.read.format("delta").load(RESULT_PATH)
 person_versions = {}
 version_metrics = {}
+version_metrics_labelled = {}
 for _s in SPLITS:
     _base_multi = base_multi_fn(matched[_s], result, spark=spark, write_path=f"{OUT_SPLIT_PATH[_s]}/base_multi")
     person_versions[_s] = person_versions_fn(
@@ -466,6 +470,10 @@ for _s in SPLITS:
     )
     version_metrics[_s] = version_metrics_fn(
         version_components, person_versions[_s], _s, spark=spark, write_path=f"{OUT_SPLIT_PATH[_s]}/version_metrics_v2"
+    )
+    version_metrics_labelled[_s] = version_metrics_fn(
+        version_components, person_versions[_s], _s, by="labelled",
+        spark=spark, write_path=f"{OUT_SPLIT_PATH[_s]}/version_metrics_by_labelled",
     )
 
 # COMMAND ----------
@@ -502,6 +510,10 @@ for _s in SPLITS:
 # MAGIC | `pct_persons_split` | Affinity persons with 2+ nodes whose nodes sit in 2+ components |
 # MAGIC
 # MAGIC Size tables: rows = component size bucket, columns = version; `(n)` = judgeable components in the cell.
+# MAGIC "Number of labelled nodes" tables: rows = how many nodes in the component match exactly one
+# MAGIC Affinity person. A component with more labelled nodes has more chances to show 2 Affinity
+# MAGIC persons, so these compare versions on equal footing (versions without TTD / ID5_UID / ST links
+# MAGIC pack more labelled nodes into a component of the same size).
 
 # COMMAND ----------
 
@@ -612,6 +624,17 @@ for _s in SPLITS:
     for _k in ("healthy", "healthy_multi", "incomplete", "incomplete_multi"):
         print(f"=== [{_s}] % {_k} of judgeable multi-node components, version x size ===")
         print(_by_size(_bs, f"pct_{_k}").fillna("").to_string())
+        print()
+    # Same, but rows = number of labelled nodes (nodes matched to one Affinity person).
+    _ml = version_metrics_labelled[_s].toPandas()
+    _bl = _rates(_ml[_ml["n_judgeable"] > 0])
+    _bl["cell"] = _bl["pct_pure"].astype(str) + " (" + _bl["n_judgeable"].astype(int).astype(str) + ")"
+    print(f"=== [{_s}] % pure of judgeable components, version x number of labelled nodes (n_judgeable) ===")
+    print(_by_size(_bl, "cell").fillna("").rename_axis("labelled_nodes").to_string())
+    print()
+    for _k in ("healthy_multi", "healthy"):
+        print(f"=== [{_s}] % {_k} of judgeable components, version x number of labelled nodes ===")
+        print(_by_size(_bl, f"pct_{_k}").fillna("").rename_axis("labelled_nodes").to_string())
         print()
 
 # COMMAND ----------
