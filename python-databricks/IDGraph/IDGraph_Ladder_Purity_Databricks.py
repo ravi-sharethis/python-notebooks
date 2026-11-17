@@ -114,7 +114,8 @@ RATE_CLIP = 0.01  # keeps a rate of 0 or 1 from giving unbounded evidence
 # Calibration uses tune components with exactly this many labelled nodes; the holdout
 # check uses holdout components with this many.
 REFERENCE_LABELLED = 2
-PURITY_BANDS = [0.5, 0.7, 0.9]
+# Predicted-purity distribution: bands of this width from 0 to 1.
+PURITY_BAND_WIDTH = 0.05
 N_SCORE_BINS = 1000
 LR_REG_PARAM = 0.001
 
@@ -445,7 +446,7 @@ purity_scores = purity_scores_fn(component_scores, spark=spark, write_path=f"{PU
 # MAGIC | `p_pure` | calibrated P(pure) from (nb_sum, log2 size) |
 # MAGIC | `auc` | holdout AUC on components with REFERENCE_LABELLED labelled nodes (0.5 = chance) |
 # MAGIC | `predicted`, `actual` | mean p_pure vs actual share pure, holdout, per 10% band |
-# MAGIC | band columns | share of ALL multi-node components of the version whose p_pure falls in the band |
+# MAGIC | band rows | share of ALL multi-node components of the version whose p_pure falls in the band (PURITY_BAND_WIDTH wide, 0 to 1) |
 
 # COMMAND ----------
 
@@ -491,17 +492,13 @@ print("=== holdout calibration of p_pure, by 10% band ===")
 print(_cal[["n", "predicted", "actual"]].to_string())
 print()
 
-_b = PURITY_BANDS
-_band = (
-    F.when(F.col("p_pure") >= _b[2], F.lit(f">={_b[2]}"))
-    .when(F.col("p_pure") >= _b[1], F.lit(f"{_b[1]}-{_b[2]}"))
-    .when(F.col("p_pure") >= _b[0], F.lit(f"{_b[0]}-{_b[1]}"))
-    .otherwise(F.lit(f"<{_b[0]}"))
-)
-_pd = purity_scores.groupBy("version", _band.alias("band")).agg(F.count("*").alias("n")).toPandas()
+_n_bands = int(round(1 / PURITY_BAND_WIDTH))
+_band_i = F.least(F.floor(F.col("p_pure") / PURITY_BAND_WIDTH), F.lit(_n_bands - 1)).cast("int")
+_pd = purity_scores.groupBy("version", _band_i.alias("band_i")).agg(F.count("*").alias("n")).toPandas()
 _pd["pct"] = 100 * _pd["n"] / _pd.groupby("version")["n"].transform("sum")
-_order = [f">={_b[2]}", f"{_b[1]}-{_b[2]}", f"{_b[0]}-{_b[1]}", f"<{_b[0]}"]
-_dist = _pd.pivot(index="band", columns="version", values="pct").reindex(_order).fillna(0).round(1)
+_labels = [f"{i * PURITY_BAND_WIDTH:.2f}-{(i + 1) * PURITY_BAND_WIDTH:.2f}" for i in range(_n_bands)]
+_dist = _pd.pivot(index="band_i", columns="version", values="pct").reindex(range(_n_bands)).fillna(0).round(1)
+_dist.index = pd.Index(_labels, name="p_pure band")
 _mean = (
     purity_scores.groupBy("version").agg(
         F.count("*").alias("n_multi_node"), F.avg("p_pure").alias("mean_p_pure"),
