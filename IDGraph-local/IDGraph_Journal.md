@@ -982,3 +982,48 @@ in full on the first run (cheap to reuse; sampling it needs a full shuffle anywa
   absent from 17 nodes up. Sources look similar at a fixed size on the judgeable
   base. Size is the signal, so prefer rules that limit component growth (the giant
   split) over a tapad cap alone. Report: `reports/idgraph5_component_quality_report.html`.
+
+## 15. Healthy components, the link-class ladder and the purity model (2026-11-12 to 11-17)
+
+Goal question: which node type + source make healthy components (neither over- nor under-merged),
+judged by Affinity. Affinity is used for labels and evaluation only. Shared write-up (Claude doc):
+https://claude.ai/artifact/1PwFmSBdb7x7VSeTE4H7Vu. Numbers: `results/idgraph5_component_quality_sample15_2026-11-09.md`.
+
+**Findings (15% sample of IDGraph5)**
+- Per link: pairs seen in 2+ sources are the same Affinity person far more often (liid+tapad
+  74.6% tune vs tapad 58.7%, liid 54.7%; +26..43 points within a type pair over tapad-only).
+  Weakest single-source class: AAID-IDFA (35-36%).
+- Per component (notebook A token/pair tables): at a fixed size, healthy lift 0.78-1.13 only;
+  contents add little beyond size. Notebook B (node + two-source pair counts, healthy target):
+  holdout AUC 0.59-0.67, no better than size.
+- Dropped singletons (A, new cell): of 4.68M incomplete ones, 56% have their Affinity person in a
+  component holding the rest of their oversized group, 34% in the one with most co-members.
+
+**Link-class ladder** (`python-databricks/IDGraph/IDGraph_Ladder_Databricks.py`, output
+`s3://.../IDGraph5_ladder/sample15/`). V1 = 2+ source links; V2 += single-source classes with a
+pair-level same-person rate >= 60% (tapad HEM-HEM, liid HEM-IDFA, tapad IDFA-IDFA); V3 += 50-60%
+(liid IDFA-IDFA, liid AAID-HEM); V4 += the other 6 rated classes; V5 = everything (today). Components
+recomputed inside the sampled components (dropping links only splits); V5 reproduces A exactly.
+- Scale: nodes in multi-node components V1 3%, V2 17%, V4 30%, V5 100%.
+- Compared at the same number of labelled nodes (2), % pure tune/holdout: V1 70/82, V2 61/78,
+  V3 60/77, V4 53/71, V5 50/67. By component size the order looked reversed: detection bias
+  (no TTD/ID5/ST links -> more labelled nodes per component of a given size).
+- V2 = best balance so far; whole graph (est.): 30% of today's multi-node components, 1.49B more
+  unlinked nodes.
+
+**Purity model** (`IDGraph_Ladder_Purity_Databricks.py`; write-up `reports/ladder_purity_model.md`).
+Naive Bayes using only notebook A's tune rates at the component's size bucket: size prior,
+component-level link-class rates (pair table), node-token rates (token table), lift fallback for
+thin cells. Links as the sources provided them: n - 1 links per component, best-rated first; a pair
+from 2 sources = one link. Scores p_raw, p_pure (size-calibrated), p_best, p_worst.
+- Run 2026-11-17: mean p_pure V1 .675, V2 .641, V3 .638, V4 .606, V5 .611; holdout AUC .64; no
+  component above 0.70 -> mostly the size prior. Holdout calibration ~0.15 low (split effect).
+- Caveats: rates from today's graph (V5) applied to V1-V4; the ladder used pair-level rates, the
+  model component-level rates (different measures, documented).
+
+**Open / next**
+- Incomplete (reattach) model for unlinked nodes: designed, set aside (node-to-component
+  candidates from oversized keys).
+- Split V5 into TTD / ID5_UID / ST steps (later).
+- Possibly rebuild the ladder on component-level link scores.
+- Person vs household question for "over-merged" (unresolved).

@@ -1,6 +1,6 @@
 # Component purity model (naive Bayes)
 
-Status: built and toy-tested 2026-11-17, not yet run on the real sample. Owner: Ravi.
+Status: built 2026-11-17 and run on the 15% sample (results: `IDGraph-local/results/idgraph5_component_quality_sample15_2026-11-09.md`, last section). Owner: Ravi.
 Notebook: `python-databricks/IDGraph/IDGraph_Ladder_Purity_Databricks.py`.
 
 ## What it does
@@ -232,3 +232,21 @@ tables and the ladder's pair lists: rates, the n - 1 picked links, nb_sum,
 - Graph versions: `python-databricks/IDGraph/IDGraph_Ladder_Databricks.py`.
 - This model: `python-databricks/IDGraph/IDGraph_Ladder_Purity_Databricks.py`
   (writes under `IDGraph5_ladder/sample15/purity_v2/`).
+
+## First results (15% sample, run 2026-11-17)
+
+| Version | Multi-node components | Mean p_pure | Mean p_best / p_worst | Holdout AUC of p_pure |
+| --- | --- | --- | --- | --- |
+| V1 | 3.2M | 0.675 | 0.700 / 0.688 | 0.57 |
+| V2 | 14.0M | 0.641 | 0.647 / 0.636 | 0.62 |
+| V3 | 14.1M | 0.638 | 0.644 / 0.633 | 0.63 |
+| V4 | 17.4M | 0.606 | 0.623 / 0.605 | 0.62 |
+| V5 (today) | 46.5M | 0.611 | 0.628 / 0.607 | 0.65 |
+
+- The ordering matches the measured purity (V1 > V2 ~ V3 > V4 ~ V5).
+- Holdout AUC 0.64 overall: the model ranks components only modestly.
+- No component scores above 0.70, the purity of 2-node components: scores stay
+  close to the size prior, and links and nodes move them only a little.
+- On holdout, predicted is about 0.15 below actual in every band: holdout holds
+  30% of Affinity persons, so fewer over-merges are visible there. The ranking
+  is unaffected.

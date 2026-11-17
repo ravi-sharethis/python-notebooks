@@ -237,3 +237,18 @@ avg 27-236 candidate components.
 Link-class quality carries to components: each step down the ladder raises purity (+3 drop
 TTD/ID5/ST single-source, +7 drop the <50% classes, ~0 V3->V2, +9 two-source only), at a large
 cost in linked nodes. V2 is the best balance so far; reattaching the rest = incomplete model (#4).
+
+---
+# Ladder purity model run (2026-11-17, commits df23143 / 43bc42d)
+Naive Bayes with notebook A's size-adjusted rates (see IDGraph-local/reports/ladder_purity_model.md).
+| version | multi-node comps | mean p_pure | mean p_best | mean p_worst | holdout AUC p_pure |
+|---|---|---|---|---|---|
+| V1 | 3.20M | 0.675 | 0.700 | 0.688 | 0.575 |
+| V2 | 14.03M | 0.641 | 0.647 | 0.636 | 0.618 |
+| V3 | 14.06M | 0.638 | 0.644 | 0.633 | 0.629 |
+| V4 | 17.39M | 0.606 | 0.623 | 0.605 | 0.617 |
+| V5 | 46.51M | 0.611 | 0.628 | 0.607 | 0.648 |
+All AUC 0.638 (p_raw 0.623, p_best 0.635, p_worst 0.634); n = 708K holdout comps with 2 labelled nodes.
+No component above 0.70 (= size-2 prior); scores ~ size prior + small token shifts. Holdout
+calibration ~0.15 below actual in every band (tune vs holdout split effect). Ordering matches
+measured purity (V1 > V2 ~ V3 > V4 ~ V5). Lift fallback: 163/513 link cells, 53/198 node cells.
